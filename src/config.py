@@ -26,6 +26,9 @@ class BacktestConfig:
     no_trade_band_l1: float = 0.05
     full_rebalance_band_l1: float = 0.20
     covariance_method: str = "ledoit_wolf"
+    regime_lookback: int = 252
+    regime_states: int = 2
+    regime_covariance_method: str = "ledoit_wolf"
     monitoring_lookback: int = 63
     regime_model_type: str = "random_forest"
     regime_test_fraction: float = 0.30
@@ -36,11 +39,22 @@ class BacktestConfig:
     selection_turnover_penalty_weight: float = 1.0
     selection_risk_gap_penalty_weight: float = 2.0
     selection_epsilon_change_penalty_weight: float = 5.0
+    selection_constraint_penalty_weight: float = 1.0
+    selection_fallback_penalty_weight: float = 10.0
     raw_data_path: str = "data/raw_prices.parquet"
     large_universe_raw_data_path: str = "data/large_universe_raw_prices.parquet"
     refresh_data: bool = False
     large_universe_size: int = 30
     sensitivity_rebalance_samples: int = 5
+    drmv_target_method: str = "benchmark_fraction"
+    drmv_target_scale: float = 0.50
+    drmv_alpha_bar_rule: str = "delta_adjusted"
+    drmv_p_norm: int = 2
+    drmv_alpha_bar_scale_grid: list[float] = field(default_factory=lambda: [0.50, 0.75, 1.0])
+    drmv_delta_grid: list[float] = field(default_factory=lambda: [1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3])
+    drmv_covariance_methods: list[str] = field(default_factory=lambda: ["sample", "ledoit_wolf", "oas", "ewma"])
+    regime_stressed_target_scale: float = 0.85
+    regime_stressed_delta_scale: float = 1.25
     wasserstein_proxy_radius_grid: list[float] = field(
         default_factory=lambda: [0.0, 1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2e-2]
     )

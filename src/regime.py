@@ -5,6 +5,9 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from .baselines import ensure_psd
+from .covariance import estimate_covariance_matrix
+
 
 DEFAULT_REGIME_FEATURE_COLUMNS = [
     "trailing_vol",
@@ -16,6 +19,150 @@ DEFAULT_REGIME_FEATURE_COLUMNS = [
     "forecast_realized_risk_gap",
     "cross_sectional_dispersion",
 ]
+
+
+def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    normalized = weights / max(weights.sum(), 1e-12)
+    return np.sum(values * normalized[:, None], axis=0)
+
+
+def _weighted_covariance(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    normalized = weights / max(weights.sum(), 1e-12)
+    mean = _weighted_mean(values, normalized)
+    demeaned = values - mean
+    covariance = (demeaned * normalized[:, None]).T @ demeaned
+    return covariance
+
+
+def estimate_regime_probabilities(
+    market_factor_series: pd.Series,
+    n_regimes: int = 2,
+    lookback: int | None = None,
+    random_state: int = 7,
+) -> pd.DataFrame:
+    """
+    Estimate simple regime probabilities from a market-factor proxy.
+
+    This is a lightweight two-state approximation using a Gaussian mixture on
+    factor returns and their absolute magnitude. It is meant to feed
+    regime-conditioned portfolio inputs, not to be treated as a macro regime
+    oracle.
+    """
+
+    from sklearn.mixture import GaussianMixture
+
+    factor = market_factor_series.dropna()
+    if lookback is not None:
+        factor = factor.tail(lookback)
+    if factor.empty:
+        raise ValueError("Market factor series is empty after lookback filtering.")
+
+    feature_frame = pd.DataFrame(
+        {
+            "market_factor": factor,
+            "abs_market_factor": factor.abs(),
+        },
+        index=factor.index,
+    )
+    if len(feature_frame) < max(10, n_regimes):
+        probabilities = np.full((len(feature_frame), n_regimes), 1.0 / n_regimes)
+        state_means = np.repeat(float(feature_frame["market_factor"].mean()), n_regimes)
+    else:
+        model = GaussianMixture(n_components=n_regimes, covariance_type="full", random_state=random_state)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="KMeans is known to have a memory leak on Windows with MKL")
+            model.fit(feature_frame.to_numpy())
+        probabilities = model.predict_proba(feature_frame.to_numpy())
+        state_means = model.means_[:, 0]
+
+    state_order = np.argsort(state_means)
+    stressed_state = int(state_order[0])
+    calm_state = int(state_order[-1])
+
+    regime_probs = pd.DataFrame(
+        probabilities,
+        index=feature_frame.index,
+        columns=[f"regime_{idx}_prob" for idx in range(n_regimes)],
+    )
+    regime_probs["most_likely_regime"] = probabilities.argmax(axis=1)
+    regime_probs["stressed_probability"] = regime_probs[f"regime_{stressed_state}_prob"]
+    regime_probs["stressed_state"] = stressed_state
+    regime_probs["calm_state"] = calm_state
+    return regime_probs
+
+
+def estimate_regime_conditioned_inputs(
+    asset_returns: pd.DataFrame,
+    factor_returns: pd.Series | None = None,
+    regime_probs: pd.DataFrame | None = None,
+    lookback: int = 252,
+    covariance_method: str = "ledoit_wolf",
+) -> dict[str, object]:
+    """
+    Estimate current regime-conditioned mean returns and covariance.
+
+    The recent return window is split probabilistically across the inferred
+    regimes. State-specific means and covariances are estimated first, then the
+    latest regime probabilities are used to form a current mixture input pair.
+    """
+
+    recent_returns = asset_returns.tail(lookback).fillna(0.0)
+    if recent_returns.empty:
+        raise ValueError("Asset returns are empty after lookback filtering.")
+
+    if factor_returns is None:
+        factor_returns = recent_returns.mean(axis=1).rename("market_factor")
+    else:
+        factor_returns = factor_returns.reindex(recent_returns.index).fillna(0.0)
+
+    if regime_probs is None:
+        regime_probs = estimate_regime_probabilities(factor_returns, n_regimes=2, lookback=len(recent_returns))
+
+    aligned_probs = regime_probs.reindex(recent_returns.index).dropna()
+    aligned_returns = recent_returns.reindex(aligned_probs.index).fillna(0.0)
+    probability_columns = [column for column in aligned_probs.columns if column.endswith("_prob")]
+    if not probability_columns:
+        raise ValueError("Regime probability frame does not contain probability columns.")
+
+    state_means: dict[str, pd.Series] = {}
+    state_covariances: dict[str, np.ndarray] = {}
+    values = aligned_returns.to_numpy()
+
+    for probability_column in probability_columns:
+        state_weights = aligned_probs[probability_column].to_numpy(dtype=float)
+        if state_weights.sum() <= 1e-12:
+            state_means[probability_column] = aligned_returns.mean().rename(probability_column)
+            state_covariances[probability_column] = estimate_covariance_matrix(aligned_returns, method=covariance_method)
+            continue
+        state_mean = pd.Series(_weighted_mean(values, state_weights), index=aligned_returns.columns, name=probability_column)
+        state_cov = _weighted_covariance(values, state_weights)
+        state_means[probability_column] = state_mean
+        state_covariances[probability_column] = (
+            estimate_covariance_matrix(aligned_returns, method=covariance_method) if np.isnan(state_cov).any() else ensure_psd(state_cov)
+        )
+
+    latest_probabilities = aligned_probs[probability_columns].iloc[-1]
+    mixture_mean = sum(float(latest_probabilities[column]) * state_means[column] for column in probability_columns)
+    mixture_covariance = np.zeros((aligned_returns.shape[1], aligned_returns.shape[1]), dtype=float)
+    for column in probability_columns:
+        state_mean_vector = state_means[column].reindex(aligned_returns.columns).to_numpy()
+        state_covariance = state_covariances[column]
+        mean_gap = state_mean_vector - mixture_mean.reindex(aligned_returns.columns).to_numpy()
+        mixture_covariance += float(latest_probabilities[column]) * (state_covariance + np.outer(mean_gap, mean_gap))
+
+    stressed_state = int(aligned_probs["stressed_state"].iloc[-1]) if "stressed_state" in aligned_probs else 0
+    latest_regime = int(aligned_probs["most_likely_regime"].iloc[-1])
+    stressed_probability = float(aligned_probs[f"regime_{stressed_state}_prob"].iloc[-1])
+
+    return {
+        "mean_returns": mixture_mean.rename("regime_conditioned_mean"),
+        "covariance": ensure_psd(mixture_covariance),
+        "latest_regime": latest_regime,
+        "stressed_probability": stressed_probability,
+        "regime_probabilities": aligned_probs,
+        "state_means": state_means,
+        "state_covariances": state_covariances,
+    }
 
 
 def build_regime_labels(

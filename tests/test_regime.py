@@ -58,3 +58,29 @@ def test_regime_classifier_and_conditional_summary() -> None:
 
     assert not summary.empty
     assert "avg_chosen_epsilon" in summary.columns
+
+
+def test_regime_conditioned_inputs_return_mean_and_covariance() -> None:
+    dates = pd.date_range("2024-01-01", periods=40, freq="W")
+    asset_returns = pd.DataFrame(
+        {
+            "A": np.linspace(-0.01, 0.02, 40),
+            "B": np.linspace(-0.005, 0.015, 40),
+            "C": np.linspace(0.0, 0.01, 40),
+        },
+        index=dates,
+    )
+    market_factor = asset_returns.mean(axis=1)
+
+    regime_probs = regime.estimate_regime_probabilities(market_factor, n_regimes=2, lookback=40, random_state=7)
+    inputs = regime.estimate_regime_conditioned_inputs(
+        asset_returns=asset_returns,
+        factor_returns=market_factor,
+        regime_probs=regime_probs,
+        lookback=40,
+        covariance_method="sample",
+    )
+
+    assert set(inputs["mean_returns"].index) == set(asset_returns.columns)
+    assert inputs["covariance"].shape == (3, 3)
+    assert 0.0 <= float(inputs["stressed_probability"]) <= 1.0

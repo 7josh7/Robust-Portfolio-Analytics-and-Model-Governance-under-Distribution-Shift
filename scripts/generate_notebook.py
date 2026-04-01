@@ -45,11 +45,12 @@ This notebook studies portfolio construction under estimation fragility, but it 
 
 - Rolling out-of-sample backtesting with explicit train, validation, and test windows
 - Frozen market-data workflow with a cached raw price snapshot
-- Baselines, a fragile sample mean-variance benchmark, and a Wasserstein-proxy min-variance allocator
+- Baselines, a fragile sample mean-variance benchmark, a Wasserstein-proxy min-variance allocator, and a paper-aligned DR mean-variance branch
 - Soft feasibility via a slack variable, composite radius selection, epsilon smoothing, and execution controls
 - Historical stress windows, model stress scenarios, and corruption-aware noisy-data experiments
 - Prototype monitoring workflow with separate instability targets and calibration metrics
 - A targeted heuristic regime-tagging extension used only for conditional governance diagnostics
+- Static versus regime-conditioned DRMV inputs using a lightweight two-state market-factor regime engine
 
 **Not fully implemented**
 
@@ -64,7 +65,8 @@ This notebook studies portfolio construction under estimation fragility, but it 
 
 The theoretical papers motivate this project, but the implementation stays intentionally narrower than the original theory:
 
-- The main allocator is a **Wasserstein-inspired proxy**, not an exact Esfahani-Kuhn or Blanchet-Chen-Zhou distributionally robust reformulation.
+- The main proxy allocator is a **Wasserstein-inspired proxy**, not an exact Esfahani-Kuhn reformulation.
+- The new DR mean-variance branch is closer in spirit to Blanchet-Chen-Zhou, but it is still a practical implementation rather than the paper's full inference stack.
 - The noisy-data section is a **corruption-aware stress-testing layer**, not Farokhi's convolution-based noisy-observation ambiguity model.
 - The Kelly-style appendix below is a **log-return-space proxy** inspired by the paper, not the paper's exact convex reformulation.
 """
@@ -94,7 +96,7 @@ PROJECT_ROOT = Path.cwd()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src import backtest, baselines, corruption, data, features, monitoring, regime, robust, validation
+from src import backtest, baselines, corruption, data, features, monitoring, regime, robust, selection, validation
 from src.config import BacktestConfig
 
 warnings.filterwarnings("ignore")
@@ -150,7 +152,7 @@ display(quality_report["annualized_volatility"].to_frame())
 
 The claim in this notebook is intentionally narrower than "robust optimization outperformed." A more defensible objective is:
 
-> A Wasserstein-inspired proxy allocator can change allocation behavior and gives us a disciplined way to measure stability tradeoffs under noisy or stressed inputs, but the current specification does **not** yet prove that it degrades less under noise than simpler baselines.
+> A Wasserstein-inspired proxy allocator and a paper-aligned DR mean-variance branch give us disciplined ways to measure robustness tradeoffs under noisy or stressed inputs, but the current specification still treats robustness as something to **measure and compare**, not something to assume.
 
 That is why the notebook measures:
 
@@ -164,7 +166,12 @@ That is why the notebook measures:
     markdown_cell(
         """## Section 4 - Strategy set
 
-The baseline set includes robust and non-robust allocators, plus one intentionally fragile benchmark that uses sample means directly. The robust model is labeled as a **Wasserstein proxy** because it uses a tractable robust-return constraint rather than a full DRO reformulation.
+The strategy set now has two robust branches:
+
+- `wasserstein_proxy_min_var`: a practical proxy baseline
+- `drmv_regularized_min_var`: a closer-to-paper DR mean-variance branch
+
+There is also a `drmv_regime_conditioned_min_var` variant that feeds the DRMV branch with regime-conditioned expected returns and covariance estimates from a lightweight two-state market-factor model.
 """
     ),
     code_cell(
@@ -230,6 +237,69 @@ def wasserstein_proxy_strategy(train_returns, val_returns, previous_weights, con
     )
 
 
+def drmv_regularized_strategy(train_returns, val_returns, previous_weights, config):
+    return selection.tune_drmv_regularized_min_variance(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        delta_grid=config["drmv_delta_grid"],
+        alpha_bar_scale_grid=config["drmv_alpha_bar_scale_grid"],
+        covariance_methods=config["drmv_covariance_methods"],
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+        p_norm=config["drmv_p_norm"],
+        target_method=config["drmv_target_method"],
+        target_scale=config["drmv_target_scale"],
+        target_quantile=config["target_return_quantile"],
+        fixed_target_return=config["fixed_target_return"],
+        alpha_bar_rule=config["drmv_alpha_bar_rule"],
+        selection_turnover_penalty_weight=config["selection_turnover_penalty_weight"],
+        selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
+        selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
+        selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        metric=config["robust_validation_metric"],
+        rebalance_date=config.get("rebalance_date"),
+    )
+
+
+def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weights, config):
+    regime_inputs = selection.prepare_regime_conditioned_inputs(
+        train_returns=train_returns,
+        lookback=config["regime_lookback"],
+        n_regimes=config["regime_states"],
+        covariance_method=config["regime_covariance_method"],
+        random_state=config["seed"],
+    )
+    return selection.tune_drmv_regularized_min_variance(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        delta_grid=config["drmv_delta_grid"],
+        alpha_bar_scale_grid=config["drmv_alpha_bar_scale_grid"],
+        covariance_methods=config["drmv_covariance_methods"],
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+        p_norm=config["drmv_p_norm"],
+        target_method=config["drmv_target_method"],
+        target_scale=config["drmv_target_scale"],
+        target_quantile=config["target_return_quantile"],
+        fixed_target_return=config["fixed_target_return"],
+        alpha_bar_rule=config["drmv_alpha_bar_rule"],
+        selection_turnover_penalty_weight=config["selection_turnover_penalty_weight"],
+        selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
+        selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
+        selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        metric=config["robust_validation_metric"],
+        mean_returns=regime_inputs["mean_returns"],
+        covariance=regime_inputs["covariance"],
+        regime_conditioned=True,
+        stressed_probability=regime_inputs["stressed_probability"],
+        stressed_target_scale=config["regime_stressed_target_scale"],
+        stressed_delta_scale=config["regime_stressed_delta_scale"],
+        rebalance_date=config.get("rebalance_date"),
+    )
+
+
 STRATEGIES = {
     "equal_weight": equal_weight_strategy,
     "inverse_vol": inverse_vol_strategy,
@@ -237,6 +307,8 @@ STRATEGIES = {
     "shrinkage_min_var": shrinkage_min_var_strategy,
     "sample_mean_variance": sample_mean_variance_strategy,
     "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
+    "drmv_regularized_min_var": drmv_regularized_strategy,
+    "drmv_regime_conditioned_min_var": drmv_regime_conditioned_strategy,
 }
 """
     ),
@@ -277,6 +349,11 @@ proxy_diagnostics = proxy_diagnostics.join(
     ).rename("realized_vol_regime")
 )
 display(proxy_diagnostics.groupby("realized_vol_regime")[["chosen_epsilon", "slack_used"]].mean())
+
+drmv_diagnostics = rebalance_results[rebalance_results["strategy"].isin(["drmv_regularized_min_var", "drmv_regime_conditioned_min_var"])][
+    ["strategy", "chosen_delta", "alpha_bar", "nominal_target_return", "binding_margin", "covariance_method", "stressed_probability", "fallback_used"]
+]
+display(drmv_diagnostics.tail(12))
 """
     ),
     markdown_cell(
@@ -309,32 +386,46 @@ for label, (start, end) in split_windows.items():
     split_rows.append(split_summary)
 
 split_summary_table = pd.concat(split_rows, ignore_index=True)
-display(split_summary_table[["window", "strategy", "annualized_return", "gross_annualized_return", "sharpe_ratio", "gross_sharpe_ratio", "average_turnover", "trade_skip_fraction", "average_execution_eta", "positive_slack_fraction"]])
+display(split_summary_table[["window", "strategy", "annualized_return", "gross_annualized_return", "sharpe_ratio", "gross_sharpe_ratio", "average_turnover", "trade_skip_fraction", "average_execution_eta", "constraint_binding_frequency", "positive_slack_fraction"]])
 
 validation_score_summary = (
-    rebalance_results.groupby("strategy")[["validation_score", "chosen_epsilon", "slack_used", "execution_eta", "epsilon_change"]]
+    rebalance_results.groupby("strategy")[["validation_score", "chosen_epsilon", "chosen_delta", "slack_used", "execution_eta", "epsilon_change", "binding_margin"]]
     .mean()
     .rename(columns={"validation_score": "avg_validation_score"})
 )
 display(validation_score_summary)
 
+drmv_summary = summary_table.loc[
+    [strategy for strategy in summary_table.index if strategy in ["drmv_regularized_min_var", "drmv_regime_conditioned_min_var", "wasserstein_proxy_min_var"]],
+    [
+        "annualized_return",
+        "sharpe_ratio",
+        "average_turnover",
+        "forecast_realized_risk_gap",
+        "average_constraint_margin",
+        "constraint_binding_frequency",
+        "average_chosen_delta",
+    ],
+]
+display(drmv_summary)
+
 rolling_perf = backtest.build_rolling_performance_diagnostics(daily_returns, window=126)
 rolling_rebalance = backtest.build_rolling_rebalance_diagnostics(rebalance_results, window=6)
 
 fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharex=False)
-rolling_perf["rolling_sharpe"][["sample_min_var", "sample_mean_variance", "wasserstein_proxy_min_var"]].plot(ax=axes[0, 0])
+rolling_perf["rolling_sharpe"][["sample_min_var", "wasserstein_proxy_min_var", "drmv_regularized_min_var", "drmv_regime_conditioned_min_var"]].plot(ax=axes[0, 0])
 axes[0, 0].set_title("Rolling 6M Sharpe")
 axes[0, 0].set_ylabel("Sharpe")
 
-rolling_perf["rolling_drawdown"][["sample_min_var", "sample_mean_variance", "wasserstein_proxy_min_var"]].plot(ax=axes[0, 1])
+rolling_perf["rolling_drawdown"][["sample_min_var", "wasserstein_proxy_min_var", "drmv_regularized_min_var", "drmv_regime_conditioned_min_var"]].plot(ax=axes[0, 1])
 axes[0, 1].set_title("Rolling 6M Drawdown")
 axes[0, 1].set_ylabel("Drawdown")
 
-rolling_rebalance["rolling_turnover"][["sample_min_var", "sample_mean_variance", "wasserstein_proxy_min_var"]].plot(ax=axes[1, 0])
+rolling_rebalance["rolling_turnover"][["sample_min_var", "wasserstein_proxy_min_var", "drmv_regularized_min_var", "drmv_regime_conditioned_min_var"]].plot(ax=axes[1, 0])
 axes[1, 0].set_title("Rolling Rebalance Turnover")
 axes[1, 0].set_ylabel("Turnover")
 
-rolling_rebalance["rolling_risk_gap"][["sample_min_var", "sample_mean_variance", "wasserstein_proxy_min_var"]].plot(ax=axes[1, 1])
+rolling_rebalance["rolling_risk_gap"][["sample_min_var", "wasserstein_proxy_min_var", "drmv_regularized_min_var", "drmv_regime_conditioned_min_var"]].plot(ax=axes[1, 1])
 axes[1, 1].set_title("Rolling Rebalance Risk Gap")
 axes[1, 1].set_ylabel("|realized - forecast vol|")
 plt.tight_layout()
@@ -400,6 +491,7 @@ sensitivity_table = backtest.run_sensitivity_scenarios(
         "shrinkage_min_var": shrinkage_min_var_strategy,
         "sample_mean_variance": sample_mean_variance_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
+        "drmv_regularized_min_var": drmv_regularized_strategy,
     },
     config=CONFIG,
     rebalance_dates=sampled_dates,
@@ -449,6 +541,7 @@ noise_summary = backtest.run_corruption_stress(
         "sample_min_var": sample_min_var_strategy,
         "sample_mean_variance": sample_mean_variance_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
+        "drmv_regularized_min_var": drmv_regularized_strategy,
     },
     corruption_scenarios=corruption_scenarios,
     config=CONFIG,
@@ -643,6 +736,7 @@ model_stress_artifacts = backtest.run_rolling_backtest(
     strategies={
         "sample_min_var": sample_min_var_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
+        "drmv_regularized_min_var": drmv_regularized_strategy,
     },
     config=model_stress_config,
 )
@@ -733,6 +827,7 @@ try:
         "sample_min_var": sample_min_var_strategy,
         "shrinkage_min_var": shrinkage_min_var_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
+        "drmv_regularized_min_var": drmv_regularized_strategy,
     }
 
     start_clock = time.perf_counter()
@@ -856,10 +951,12 @@ The revised project supports a stronger and more honest story than the original 
 1. The allocator is implemented as a **tractable Wasserstein proxy**, not oversold as a full DRO system.
 2. Soft feasibility makes the optimization workflow diagnosable: target tension shows up as **slack**, not silent failure.
 3. Historical stress summaries are now methodologically correct because governance metrics are filtered to the same window as returns.
-4. Corruption-aware experiments and direct sensitivity analysis support a stability-measurement narrative better than raw Sharpe alone, but the current automated regression check still does **not** show a clean noisy-input robustness win for the proxy.
-5. The optional Kelly-style appendix moves the uncertainty model into **log-return space**, but it is still a tractable proxy rather than the paper's exact Wasserstein-Kelly reformulation.
-6. The monitoring layer is best understood as a **prototype governance workflow** with calibration and alert diagnostics, not a predictive alpha claim.
-7. The heuristic regime-tagging extension is intentionally narrow: it helps condition diagnostics on market state, but its high accuracy mainly reflects recovery of a hand-crafted labeling rule, not a standalone predictive edge.
+4. The new DRMV branch is closer to the regularized DR mean-variance literature and gives us a cleaner ambiguity parameter (`delta`) plus a conservative robust target (`alpha_bar`) to track in validation.
+5. Regime-conditioned DRMV inputs create a practical bridge from market-state inference to portfolio construction, even though the regime engine remains a lightweight approximation rather than a full factor-model implementation.
+6. Corruption-aware experiments and direct sensitivity analysis support a stability-measurement narrative better than raw Sharpe alone, but the automated noisy-input regression check should still be treated as an empirical test rather than a foregone conclusion.
+7. The optional Kelly-style appendix moves the uncertainty model into **log-return space**, but it is still a tractable proxy rather than the paper's exact Wasserstein-Kelly reformulation.
+8. The monitoring layer is best understood as a **prototype governance workflow** with calibration and alert diagnostics, not a predictive alpha claim.
+9. The heuristic regime-tagging extension is intentionally narrow: it helps condition diagnostics on market state, but its high accuracy mainly reflects recovery of a hand-crafted labeling rule, not a standalone predictive edge.
 """
     ),
 ]

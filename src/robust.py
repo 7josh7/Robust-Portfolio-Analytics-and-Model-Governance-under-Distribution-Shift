@@ -16,7 +16,9 @@ from .baselines import (
     inverse_volatility_weight,
     solve_min_variance,
 )
+from .covariance import estimate_covariance_matrix
 from .features import herfindahl_index
+from .targets import build_nominal_target
 
 
 LOGGER = logging.getLogger(__name__)
@@ -37,27 +39,24 @@ def compute_dynamic_target_return(
     fixed_target_return: float = 0.0002,
 ) -> tuple[float, str]:
     """Compute a practical target-return proxy that avoids brittle fixed hurdles."""
+    return build_nominal_target(
+        train_returns=train_returns,
+        method=mode,
+        scale=scale,
+        quantile=quantile,
+        fixed_target_return=fixed_target_return,
+    )
 
-    mode = mode.lower()
-    if mode == "fixed":
-        return float(fixed_target_return), "fixed_target_return"
 
-    if mode == "equal_weight_fraction":
-        weights = equal_weight(train_returns.columns)
-        proxy_returns = train_returns.fillna(0.0) @ weights
-        return float(scale * proxy_returns.mean()), "equal_weight_fraction"
-
-    if mode == "inverse_vol_fraction":
-        weights = inverse_volatility_weight(train_returns)
-        proxy_returns = train_returns.fillna(0.0) @ weights
-        return float(scale * proxy_returns.mean()), "inverse_vol_fraction"
-
-    if mode == "portfolio_quantile":
-        weights = equal_weight(train_returns.columns)
-        proxy_returns = train_returns.fillna(0.0) @ weights
-        return float(proxy_returns.quantile(quantile)), "portfolio_quantile"
-
-    raise ValueError(f"Unknown target-return mode: {mode}")
+def _resolve_mean_and_covariance(
+    train_returns: pd.DataFrame,
+    covariance_method: str = "ledoit_wolf",
+    mean_returns: pd.Series | None = None,
+    covariance: np.ndarray | None = None,
+) -> tuple[pd.Series, np.ndarray]:
+    resolved_mean = mean_returns.reindex(train_returns.columns).fillna(0.0) if mean_returns is not None else estimate_expected_returns(train_returns)
+    resolved_covariance = covariance if covariance is not None else estimate_covariance_matrix(train_returns, method=covariance_method)
+    return resolved_mean, ensure_psd(resolved_covariance)
 
 
 def solve_wasserstein_proxy_min_var(
@@ -65,6 +64,8 @@ def solve_wasserstein_proxy_min_var(
     epsilon: float,
     target_return: float,
     covariance_method: str = "ledoit_wolf",
+    mean_returns: pd.Series | None = None,
+    covariance: np.ndarray | None = None,
     bounds: tuple[float, float] = (0.0, 0.25),
     previous_weights: pd.Series | None = None,
     turnover_penalty: float = 0.0,
@@ -88,8 +89,12 @@ def solve_wasserstein_proxy_min_var(
     """
 
     assets = train_returns.columns
-    mu = estimate_expected_returns(train_returns)
-    covariance = estimate_covariance(train_returns, method=covariance_method)
+    mu, covariance = _resolve_mean_and_covariance(
+        train_returns=train_returns,
+        covariance_method=covariance_method,
+        mean_returns=mean_returns,
+        covariance=covariance,
+    )
     lower_bound, upper_bound = bounds
 
     # At zero radius with a hard feasibility constraint, the proxy should
@@ -235,6 +240,137 @@ def _validation_score(returns: pd.Series, metric: str) -> float:
     raise ValueError(f"Unknown validation metric: {metric}")
 
 
+def solve_drmv_regularized_min_variance(
+    mean_returns: pd.Series,
+    covariance: np.ndarray,
+    delta: float,
+    alpha_bar: float,
+    p_norm: int | float = 2,
+    long_only: bool = True,
+    lower_bound: float = 0.0,
+    upper_bound: float = 1.0,
+    previous_weights: pd.Series | None = None,
+    turnover_penalty: float = 0.0,
+    allow_slack: bool = False,
+    slack_penalty: float = 10.0,
+    solver: str = "SCS",
+    rebalance_date: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    """
+    Paper-aligned DR mean-variance branch with regularized volatility.
+
+    Objective:
+        min  ||L w||_2 + sqrt(delta) * ||w||_p
+
+    subject to:
+        1.T w = 1
+        mu.T w >= alpha_bar + sqrt(delta) * ||w||_p
+
+    The optional slack switch is an operational softening. It defaults to
+    `False` so the direct solver stays close to the paper-style formulation.
+    """
+
+    assets = mean_returns.index
+    covariance_psd = ensure_psd(covariance)
+    chol = np.linalg.cholesky(covariance_psd)
+    sqrt_delta = float(np.sqrt(max(delta, 0.0)))
+
+    w = cp.Variable(len(assets))
+    s = cp.Variable(nonneg=True) if allow_slack else None
+    robust_norm = cp.norm(w, p_norm)
+    objective = cp.norm(chol @ w, 2) + sqrt_delta * robust_norm
+    if previous_weights is not None and turnover_penalty > 0.0:
+        objective += turnover_penalty * cp.norm1(w - previous_weights.reindex(assets).fillna(0.0).to_numpy())
+    if allow_slack and s is not None:
+        objective += float(slack_penalty) * s
+
+    mu_vector = mean_returns.reindex(assets).fillna(0.0).to_numpy()
+    constraints = [cp.sum(w) == 1.0]
+    if long_only:
+        constraints.extend([w >= lower_bound, w <= upper_bound])
+    if allow_slack and s is not None:
+        constraints.append(mu_vector @ w + s >= float(alpha_bar) + sqrt_delta * robust_norm)
+    else:
+        constraints.append(mu_vector @ w >= float(alpha_bar) + sqrt_delta * robust_norm)
+
+    problem = cp.Problem(cp.Minimize(objective), constraints)
+    problem.solve(solver=solver, warm_start=True)
+
+    if w.value is None:
+        fallback = solve_min_variance(
+            covariance=covariance_psd,
+            assets=assets,
+            mu=mean_returns,
+            target_return=None,
+            bounds=(lower_bound, upper_bound),
+            previous_weights=previous_weights,
+            turnover_penalty=turnover_penalty,
+            solver=solver,
+        )
+        fallback.update(
+            {
+                "status": f"fallback::{problem.status}",
+                "chosen_delta": float(delta),
+                "alpha_bar": float(alpha_bar),
+                "worst_case_return": np.nan,
+                "concentration": herfindahl_index(fallback["weights"]),
+                "slack_used": np.nan if allow_slack else 0.0,
+                "binding_margin": np.nan,
+                "constraint_margin": np.nan,
+                "robust_penalty": np.nan,
+                "fallback_used": True,
+                "soft_feasibility_enabled": bool(allow_slack),
+                "p_norm": float(p_norm),
+            }
+        )
+        LOGGER.info(
+            "DRMV fallback triggered | date=%s | delta=%.6f | alpha_bar=%.6f | status=%s",
+            rebalance_date,
+            float(delta),
+            float(alpha_bar),
+            problem.status,
+        )
+        return fallback
+
+    weights = pd.Series(np.asarray(w.value).ravel(), index=assets, name="weight")
+    if long_only:
+        weights = weights.clip(lower=0.0)
+    weights = weights / weights.sum()
+    norm_penalty = sqrt_delta * float(np.linalg.norm(weights.to_numpy(), ord=p_norm))
+    realized_vol = float(np.sqrt(weights.to_numpy() @ covariance_psd @ weights.to_numpy()))
+    expected_return = float(mean_returns @ weights)
+    slack_used = float(max(np.asarray(s.value).item(), 0.0)) if allow_slack and s is not None and s.value is not None else 0.0
+    binding_margin = float(expected_return - float(alpha_bar) - norm_penalty + slack_used)
+
+    LOGGER.info(
+        "DRMV solve | date=%s | delta=%.6f | alpha_bar=%.6f | margin=%.6f | status=%s",
+        rebalance_date,
+        float(delta),
+        float(alpha_bar),
+        binding_margin,
+        problem.status,
+    )
+
+    return {
+        "weights": weights,
+        "status": problem.status,
+        "objective_value": float(problem.value) if problem.value is not None else np.nan,
+        "forecast_vol": float(realized_vol * np.sqrt(252)),
+        "expected_return": expected_return,
+        "worst_case_return": float(expected_return - norm_penalty),
+        "chosen_delta": float(delta),
+        "alpha_bar": float(alpha_bar),
+        "concentration": herfindahl_index(weights),
+        "slack_used": slack_used,
+        "binding_margin": binding_margin,
+        "constraint_margin": binding_margin,
+        "robust_penalty": norm_penalty,
+        "fallback_used": False,
+        "soft_feasibility_enabled": bool(allow_slack),
+        "p_norm": float(p_norm),
+    }
+
+
 def _composite_validation_score(
     returns: pd.Series,
     forecast_vol: float,
@@ -294,6 +430,8 @@ def tune_wasserstein_proxy_radius(
     target_return_scale: float = 0.50,
     target_return_quantile: float = 0.40,
     fixed_target_return: float = 0.0002,
+    mean_returns: pd.Series | None = None,
+    covariance: np.ndarray | None = None,
     previous_epsilon: float | None = None,
     selection_slack_penalty_weight: float = 5.0,
     selection_turnover_penalty_weight: float = 1.0,
@@ -326,6 +464,8 @@ def tune_wasserstein_proxy_radius(
             epsilon=epsilon,
             target_return=resolved_target,
             covariance_method=covariance_method,
+            mean_returns=mean_returns,
+            covariance=covariance,
             bounds=bounds,
             previous_weights=previous_weights,
             turnover_penalty=turnover_penalty,

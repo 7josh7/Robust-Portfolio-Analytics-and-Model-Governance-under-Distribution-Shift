@@ -173,11 +173,19 @@ def run_rolling_backtest(
                     "expected_return": result.get("expected_return", np.nan),
                     "worst_case_return": result.get("worst_case_return", np.nan),
                     "chosen_epsilon": result.get("chosen_epsilon", np.nan),
+                    "chosen_delta": result.get("chosen_delta", np.nan),
                     "validation_score": result.get("validation_score", np.nan),
                     "target_return": result.get("target_return", np.nan),
+                    "nominal_target_return": result.get("nominal_target_return", np.nan),
+                    "alpha_bar": result.get("alpha_bar", np.nan),
                     "target_source": result.get("target_source", ""),
+                    "target_rule": result.get("target_rule", ""),
+                    "covariance_method": result.get("covariance_method", ""),
+                    "regime_conditioned": result.get("regime_conditioned", False),
+                    "stressed_probability": result.get("stressed_probability", np.nan),
                     "slack_used": result.get("slack_used", np.nan),
                     "binding_margin": result.get("binding_margin", np.nan),
+                    "robust_penalty": result.get("robust_penalty", np.nan),
                     "slack_penalty": result.get("slack_penalty", np.nan),
                     "fallback_used": result.get("fallback_used", False),
                     "execution_eta": execution["execution_eta"],
@@ -274,12 +282,19 @@ def summarize_backtest(
         avg_proposed_turnover = strategy_rebalances["proposed_turnover"].mean() if "proposed_turnover" in strategy_rebalances else np.nan
         risk_gap = (strategy_rebalances["realized_vol"] - strategy_rebalances["forecast_vol"]).abs().mean()
         avg_slack = strategy_rebalances["slack_used"].mean() if "slack_used" in strategy_rebalances else np.nan
+        avg_constraint_margin = strategy_rebalances["binding_margin"].mean() if "binding_margin" in strategy_rebalances else np.nan
+        binding_frequency = (
+            float((strategy_rebalances["binding_margin"].fillna(np.inf) <= 1e-6).mean())
+            if "binding_margin" in strategy_rebalances and not strategy_rebalances.empty
+            else np.nan
+        )
         positive_slack_fraction = (
             float((strategy_rebalances["slack_used"].fillna(0.0) > 1e-10).mean())
             if "slack_used" in strategy_rebalances and not strategy_rebalances.empty
             else np.nan
         )
         avg_epsilon = strategy_rebalances["chosen_epsilon"].mean() if "chosen_epsilon" in strategy_rebalances else np.nan
+        avg_delta = strategy_rebalances["chosen_delta"].mean() if "chosen_delta" in strategy_rebalances else np.nan
         avg_epsilon_change = strategy_rebalances["epsilon_change"].mean() if "epsilon_change" in strategy_rebalances else np.nan
         avg_execution_eta = strategy_rebalances["execution_eta"].mean() if "execution_eta" in strategy_rebalances else np.nan
         trade_skip_fraction = (
@@ -315,8 +330,11 @@ def summarize_backtest(
                 "average_weight_change_l1": average_weight_change,
                 "forecast_realized_risk_gap": risk_gap,
                 "average_slack_used": avg_slack,
+                "average_constraint_margin": avg_constraint_margin,
+                "constraint_binding_frequency": binding_frequency,
                 "positive_slack_fraction": positive_slack_fraction,
                 "average_chosen_epsilon": avg_epsilon,
+                "average_chosen_delta": avg_delta,
                 "average_epsilon_change": avg_epsilon_change,
                 "average_execution_eta": avg_execution_eta,
                 "trade_skip_fraction": trade_skip_fraction,
@@ -405,8 +423,10 @@ def build_rolling_rebalance_diagnostics(
         "turnover",
         "proposed_turnover",
         "slack_used",
+        "binding_margin",
         "epsilon_change",
         "chosen_epsilon",
+        "chosen_delta",
         "execution_eta",
         "forecast_vol",
         "realized_vol",

@@ -15,6 +15,9 @@ turnover_penalty: 0.001
 no_trade_band_l1: 0.05
 full_rebalance_band_l1: 0.20
 covariance_method: "ledoit_wolf"
+regime_lookback: 252
+regime_states: 2
+regime_covariance_method: "ledoit_wolf"
 monitoring_lookback: 63
 regime_model_type: "random_forest"
 regime_test_fraction: 0.30
@@ -25,11 +28,34 @@ selection_slack_penalty_weight: 5.0
 selection_turnover_penalty_weight: 1.0
 selection_risk_gap_penalty_weight: 2.0
 selection_epsilon_change_penalty_weight: 5.0
+selection_constraint_penalty_weight: 1.0
+selection_fallback_penalty_weight: 10.0
 raw_data_path: "data/raw_prices.parquet"
 large_universe_raw_data_path: "data/large_universe_raw_prices.parquet"
 refresh_data: false
 large_universe_size: 30
 sensitivity_rebalance_samples: 5
+drmv_target_method: "benchmark_fraction"
+drmv_target_scale: 0.50
+drmv_alpha_bar_rule: "delta_adjusted"
+drmv_p_norm: 2
+drmv_alpha_bar_scale_grid:
+  - 0.5
+  - 0.75
+  - 1.0
+drmv_delta_grid:
+  - 0.0001
+  - 0.0005
+  - 0.001
+  - 0.0025
+  - 0.005
+drmv_covariance_methods:
+  - "sample"
+  - "ledoit_wolf"
+  - "oas"
+  - "ewma"
+regime_stressed_target_scale: 0.85
+regime_stressed_delta_scale: 1.25
 wasserstein_proxy_radius_grid:
   - 0.0
   - 0.0001

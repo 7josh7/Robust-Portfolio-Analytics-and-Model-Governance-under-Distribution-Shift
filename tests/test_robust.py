@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from src import baselines, robust, validation
+from src import baselines, robust, selection, validation
 
 
 def _toy_returns() -> pd.DataFrame:
@@ -100,3 +100,44 @@ def test_log_return_growth_proxy_uses_log_return_inputs() -> None:
     assert np.isclose(result["weights"].sum(), 1.0)
     assert "expected_log_return" in result
     assert "worst_case_log_return" in result
+
+
+def test_drmv_regularized_min_variance_returns_weights_and_margin() -> None:
+    train_returns = _toy_returns()
+    mean_returns = train_returns.mean()
+    covariance = baselines.estimate_covariance(train_returns, method="sample")
+
+    result = robust.solve_drmv_regularized_min_variance(
+        mean_returns=mean_returns,
+        covariance=covariance,
+        delta=0.001,
+        alpha_bar=-0.05,
+        p_norm=2,
+        lower_bound=0.0,
+        upper_bound=1.0,
+    )
+
+    assert result["weights"].notna().all()
+    assert np.isclose(result["weights"].sum(), 1.0)
+    assert "binding_margin" in result
+    assert pd.notna(result["chosen_delta"])
+
+
+def test_drmv_selector_returns_parameter_diagnostics() -> None:
+    train_returns = _toy_returns().iloc[:-63]
+    val_returns = _toy_returns().iloc[-63:]
+
+    result = selection.tune_drmv_regularized_min_variance(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        delta_grid=[0.0, 0.001],
+        alpha_bar_scale_grid=[0.75, 1.0],
+        covariance_methods=["sample", "ledoit_wolf"],
+        bounds=(0.0, 1.0),
+        target_method="benchmark_fraction",
+        target_scale=0.50,
+        alpha_bar_rule="delta_adjusted",
+    )
+
+    assert "parameter_diagnostics" in result
+    assert {"delta", "alpha_bar", "covariance_method", "validation_score"} <= set(result["parameter_diagnostics"].columns)

@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src import backtest, baselines, data, features, regime, reporting, robust  # noqa: E402
+from src import backtest, baselines, data, features, regime, reporting, robust, selection  # noqa: E402
 from src.config import BacktestConfig  # noqa: E402
 
 
@@ -77,6 +77,69 @@ def wasserstein_proxy_strategy(train_returns, val_returns, previous_weights, con
     )
 
 
+def drmv_regularized_strategy(train_returns, val_returns, previous_weights, config):
+    return selection.tune_drmv_regularized_min_variance(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        delta_grid=config["drmv_delta_grid"],
+        alpha_bar_scale_grid=config["drmv_alpha_bar_scale_grid"],
+        covariance_methods=config["drmv_covariance_methods"],
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+        p_norm=config["drmv_p_norm"],
+        target_method=config["drmv_target_method"],
+        target_scale=config["drmv_target_scale"],
+        target_quantile=config["target_return_quantile"],
+        fixed_target_return=config["fixed_target_return"],
+        alpha_bar_rule=config["drmv_alpha_bar_rule"],
+        selection_turnover_penalty_weight=config["selection_turnover_penalty_weight"],
+        selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
+        selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
+        selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        metric=config["robust_validation_metric"],
+        rebalance_date=config.get("rebalance_date"),
+    )
+
+
+def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weights, config):
+    regime_inputs = selection.prepare_regime_conditioned_inputs(
+        train_returns=train_returns,
+        lookback=config["regime_lookback"],
+        n_regimes=config["regime_states"],
+        covariance_method=config["regime_covariance_method"],
+        random_state=config["seed"],
+    )
+    return selection.tune_drmv_regularized_min_variance(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        delta_grid=config["drmv_delta_grid"],
+        alpha_bar_scale_grid=config["drmv_alpha_bar_scale_grid"],
+        covariance_methods=config["drmv_covariance_methods"],
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+        p_norm=config["drmv_p_norm"],
+        target_method=config["drmv_target_method"],
+        target_scale=config["drmv_target_scale"],
+        target_quantile=config["target_return_quantile"],
+        fixed_target_return=config["fixed_target_return"],
+        alpha_bar_rule=config["drmv_alpha_bar_rule"],
+        selection_turnover_penalty_weight=config["selection_turnover_penalty_weight"],
+        selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
+        selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
+        selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        metric=config["robust_validation_metric"],
+        mean_returns=regime_inputs["mean_returns"],
+        covariance=regime_inputs["covariance"],
+        regime_conditioned=True,
+        stressed_probability=regime_inputs["stressed_probability"],
+        stressed_target_scale=config["regime_stressed_target_scale"],
+        stressed_delta_scale=config["regime_stressed_delta_scale"],
+        rebalance_date=config.get("rebalance_date"),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the robust portfolio analytics backtest.")
     parser.add_argument("--config", default="configs/base.yaml", help="Path to the YAML config file.")
@@ -104,6 +167,8 @@ def main() -> None:
         "shrinkage_min_var": shrinkage_min_var_strategy,
         "sample_mean_variance": sample_mean_variance_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
+        "drmv_regularized_min_var": drmv_regularized_strategy,
+        "drmv_regime_conditioned_min_var": drmv_regime_conditioned_strategy,
     }
     artifacts = backtest.run_rolling_backtest(bundle.simple_returns, strategies, config)
     summary = backtest.summarize_backtest(
