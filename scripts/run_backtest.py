@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src import backtest, baselines, data, features, regime, reporting, robust, selection  # noqa: E402
 from src.config import BacktestConfig  # noqa: E402
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*You specified your problem should be solved by ECOS.*",
+    category=FutureWarning,
+)
 
 
 def equal_weight_strategy(train_returns, val_returns, previous_weights, config):
@@ -97,28 +104,49 @@ def drmv_regularized_strategy(train_returns, val_returns, previous_weights, conf
         selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
         selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
         selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        selection_sensitivity_penalty_weight=config["selection_sensitivity_penalty_weight"],
+        selection_corruption_penalty_weight=config["selection_corruption_penalty_weight"],
+        selection_stress_penalty_weight=config["selection_stress_penalty_weight"],
+        mean_perturbation_scale=config["selection_mean_perturbation_scale"],
+        covariance_perturbation_scale=config["selection_covariance_perturbation_scale"],
+        corruption_noise_scale=config["selection_corruption_noise_scale"],
+        stress_quantile=config["selection_stress_quantile"],
+        selection_sensitivity_top_k=config["selection_sensitivity_top_k"],
         metric=config["robust_validation_metric"],
         rebalance_date=config.get("rebalance_date"),
     )
 
 
-def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weights, config):
+def _build_regime_conditioned_drmv_result(train_returns, val_returns, previous_weights, config, input_mode="both"):
     regime_inputs = selection.prepare_regime_conditioned_inputs(
         train_returns=train_returns,
         lookback=config["regime_lookback"],
         n_regimes=config["regime_states"],
         covariance_method=config["regime_covariance_method"],
+        calm_covariance_method=config["regime_calm_covariance_method"],
+        stressed_covariance_method=config["regime_stressed_covariance_method"],
+        probability_temperature=config["regime_probability_temperature"],
+        stressed_probability_threshold=config["regime_probability_threshold"],
         random_state=config["seed"],
     )
+    overrides = selection.build_regime_search_overrides(
+        delta_grid=config["drmv_delta_grid"],
+        turnover_penalty=config["turnover_penalty"],
+        stress_activation=regime_inputs["stress_activation"],
+        stressed_delta_grid_multiplier=config["regime_stressed_delta_grid_multiplier"],
+        stressed_turnover_multiplier=config["regime_stressed_turnover_multiplier"],
+    )
+    mean_vector = regime_inputs["mean_returns"] if input_mode in {"mean", "both"} else None
+    covariance_matrix = regime_inputs["covariance"] if input_mode in {"covariance", "both"} else None
     return selection.tune_drmv_regularized_min_variance(
         train_returns=train_returns,
         val_returns=val_returns,
-        delta_grid=config["drmv_delta_grid"],
+        delta_grid=overrides["delta_grid"],
         alpha_bar_scale_grid=config["drmv_alpha_bar_scale_grid"],
         covariance_methods=config["drmv_covariance_methods"],
         bounds=tuple(config["bounds"]),
         previous_weights=previous_weights,
-        turnover_penalty=config["turnover_penalty"],
+        turnover_penalty=overrides["turnover_penalty"],
         p_norm=config["drmv_p_norm"],
         target_method=config["drmv_target_method"],
         target_scale=config["drmv_target_scale"],
@@ -129,14 +157,52 @@ def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weight
         selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
         selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
         selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        selection_sensitivity_penalty_weight=config["selection_sensitivity_penalty_weight"],
+        selection_corruption_penalty_weight=config["selection_corruption_penalty_weight"],
+        selection_stress_penalty_weight=config["selection_stress_penalty_weight"],
+        mean_perturbation_scale=config["selection_mean_perturbation_scale"],
+        covariance_perturbation_scale=config["selection_covariance_perturbation_scale"],
+        corruption_noise_scale=config["selection_corruption_noise_scale"],
+        stress_quantile=config["selection_stress_quantile"],
+        selection_sensitivity_top_k=config["selection_sensitivity_top_k"],
         metric=config["robust_validation_metric"],
-        mean_returns=regime_inputs["mean_returns"],
-        covariance=regime_inputs["covariance"],
+        mean_returns=mean_vector,
+        covariance=covariance_matrix,
         regime_conditioned=True,
-        stressed_probability=regime_inputs["stressed_probability"],
+        stressed_probability=regime_inputs["stress_activation"],
         stressed_target_scale=config["regime_stressed_target_scale"],
         stressed_delta_scale=config["regime_stressed_delta_scale"],
         rebalance_date=config.get("rebalance_date"),
+    )
+
+
+def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="both",
+    )
+
+
+def drmv_regime_mean_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="mean",
+    )
+
+
+def drmv_regime_covariance_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="covariance",
     )
 
 

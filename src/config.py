@@ -28,7 +28,11 @@ class BacktestConfig:
     covariance_method: str = "ledoit_wolf"
     regime_lookback: int = 252
     regime_states: int = 2
-    regime_covariance_method: str = "ledoit_wolf"
+    regime_covariance_method: str = "state_aware"
+    regime_calm_covariance_method: str = "ledoit_wolf"
+    regime_stressed_covariance_method: str = "ewma"
+    regime_probability_temperature: float = 3.0
+    regime_probability_threshold: float = 0.70
     monitoring_lookback: int = 63
     regime_model_type: str = "random_forest"
     regime_test_fraction: float = 0.30
@@ -41,6 +45,14 @@ class BacktestConfig:
     selection_epsilon_change_penalty_weight: float = 5.0
     selection_constraint_penalty_weight: float = 1.0
     selection_fallback_penalty_weight: float = 10.0
+    selection_sensitivity_penalty_weight: float = 1.0
+    selection_corruption_penalty_weight: float = 1.25
+    selection_stress_penalty_weight: float = 3.0
+    selection_mean_perturbation_scale: float = 0.25
+    selection_covariance_perturbation_scale: float = 0.20
+    selection_corruption_noise_scale: float = 0.15
+    selection_stress_quantile: float = 0.25
+    selection_sensitivity_top_k: int = 12
     raw_data_path: str = "data/raw_prices.parquet"
     large_universe_raw_data_path: str = "data/large_universe_raw_prices.parquet"
     refresh_data: bool = False
@@ -50,11 +62,17 @@ class BacktestConfig:
     drmv_target_scale: float = 0.50
     drmv_alpha_bar_rule: str = "delta_adjusted"
     drmv_p_norm: int = 2
-    drmv_alpha_bar_scale_grid: list[float] = field(default_factory=lambda: [0.50, 0.75, 1.0])
-    drmv_delta_grid: list[float] = field(default_factory=lambda: [1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3])
-    drmv_covariance_methods: list[str] = field(default_factory=lambda: ["sample", "ledoit_wolf", "oas", "ewma"])
-    regime_stressed_target_scale: float = 0.85
-    regime_stressed_delta_scale: float = 1.25
+    drmv_alpha_bar_scale_grid: list[float] = field(default_factory=lambda: [0.25, 0.50, 0.75, 1.0])
+    drmv_delta_grid: list[float] = field(
+        default_factory=lambda: [1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 2e-2]
+    )
+    drmv_covariance_methods: list[str] = field(
+        default_factory=lambda: ["ledoit_wolf", "oas", "ewma"]
+    )
+    regime_stressed_target_scale: float = 0.40
+    regime_stressed_delta_scale: float = 4.0
+    regime_stressed_turnover_multiplier: float = 6.0
+    regime_stressed_delta_grid_multiplier: float = 4.0
     wasserstein_proxy_radius_grid: list[float] = field(
         default_factory=lambda: [0.0, 1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2e-2]
     )

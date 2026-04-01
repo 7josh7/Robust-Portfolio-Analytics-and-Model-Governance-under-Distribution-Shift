@@ -257,28 +257,49 @@ def drmv_regularized_strategy(train_returns, val_returns, previous_weights, conf
         selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
         selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
         selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        selection_sensitivity_penalty_weight=config["selection_sensitivity_penalty_weight"],
+        selection_corruption_penalty_weight=config["selection_corruption_penalty_weight"],
+        selection_stress_penalty_weight=config["selection_stress_penalty_weight"],
+        mean_perturbation_scale=config["selection_mean_perturbation_scale"],
+        covariance_perturbation_scale=config["selection_covariance_perturbation_scale"],
+        corruption_noise_scale=config["selection_corruption_noise_scale"],
+        stress_quantile=config["selection_stress_quantile"],
+        selection_sensitivity_top_k=config["selection_sensitivity_top_k"],
         metric=config["robust_validation_metric"],
         rebalance_date=config.get("rebalance_date"),
     )
 
 
-def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weights, config):
+def _build_regime_conditioned_drmv_result(train_returns, val_returns, previous_weights, config, input_mode="both"):
     regime_inputs = selection.prepare_regime_conditioned_inputs(
         train_returns=train_returns,
         lookback=config["regime_lookback"],
         n_regimes=config["regime_states"],
         covariance_method=config["regime_covariance_method"],
+        calm_covariance_method=config["regime_calm_covariance_method"],
+        stressed_covariance_method=config["regime_stressed_covariance_method"],
+        probability_temperature=config["regime_probability_temperature"],
+        stressed_probability_threshold=config["regime_probability_threshold"],
         random_state=config["seed"],
     )
+    overrides = selection.build_regime_search_overrides(
+        delta_grid=config["drmv_delta_grid"],
+        turnover_penalty=config["turnover_penalty"],
+        stress_activation=regime_inputs["stress_activation"],
+        stressed_delta_grid_multiplier=config["regime_stressed_delta_grid_multiplier"],
+        stressed_turnover_multiplier=config["regime_stressed_turnover_multiplier"],
+    )
+    mean_vector = regime_inputs["mean_returns"] if input_mode in {"mean", "both"} else None
+    covariance_matrix = regime_inputs["covariance"] if input_mode in {"covariance", "both"} else None
     return selection.tune_drmv_regularized_min_variance(
         train_returns=train_returns,
         val_returns=val_returns,
-        delta_grid=config["drmv_delta_grid"],
+        delta_grid=overrides["delta_grid"],
         alpha_bar_scale_grid=config["drmv_alpha_bar_scale_grid"],
         covariance_methods=config["drmv_covariance_methods"],
         bounds=tuple(config["bounds"]),
         previous_weights=previous_weights,
-        turnover_penalty=config["turnover_penalty"],
+        turnover_penalty=overrides["turnover_penalty"],
         p_norm=config["drmv_p_norm"],
         target_method=config["drmv_target_method"],
         target_scale=config["drmv_target_scale"],
@@ -289,14 +310,52 @@ def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weight
         selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
         selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
         selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        selection_sensitivity_penalty_weight=config["selection_sensitivity_penalty_weight"],
+        selection_corruption_penalty_weight=config["selection_corruption_penalty_weight"],
+        selection_stress_penalty_weight=config["selection_stress_penalty_weight"],
+        mean_perturbation_scale=config["selection_mean_perturbation_scale"],
+        covariance_perturbation_scale=config["selection_covariance_perturbation_scale"],
+        corruption_noise_scale=config["selection_corruption_noise_scale"],
+        stress_quantile=config["selection_stress_quantile"],
+        selection_sensitivity_top_k=config["selection_sensitivity_top_k"],
         metric=config["robust_validation_metric"],
-        mean_returns=regime_inputs["mean_returns"],
-        covariance=regime_inputs["covariance"],
+        mean_returns=mean_vector,
+        covariance=covariance_matrix,
         regime_conditioned=True,
-        stressed_probability=regime_inputs["stressed_probability"],
+        stressed_probability=regime_inputs["stress_activation"],
         stressed_target_scale=config["regime_stressed_target_scale"],
         stressed_delta_scale=config["regime_stressed_delta_scale"],
         rebalance_date=config.get("rebalance_date"),
+    )
+
+
+def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="both",
+    )
+
+
+def drmv_regime_mean_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="mean",
+    )
+
+
+def drmv_regime_covariance_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="covariance",
     )
 
 
@@ -389,7 +448,19 @@ split_summary_table = pd.concat(split_rows, ignore_index=True)
 display(split_summary_table[["window", "strategy", "annualized_return", "gross_annualized_return", "sharpe_ratio", "gross_sharpe_ratio", "average_turnover", "trade_skip_fraction", "average_execution_eta", "constraint_binding_frequency", "positive_slack_fraction"]])
 
 validation_score_summary = (
-    rebalance_results.groupby("strategy")[["validation_score", "chosen_epsilon", "chosen_delta", "slack_used", "execution_eta", "epsilon_change", "binding_margin"]]
+    rebalance_results.groupby("strategy")[[
+        "validation_score",
+        "chosen_epsilon",
+        "chosen_delta",
+        "slack_used",
+        "execution_eta",
+        "epsilon_change",
+        "binding_margin",
+        "validation_sensitivity_penalty",
+        "validation_corruption_penalty",
+        "validation_stress_penalty",
+        "stressed_probability",
+    ]]
     .mean()
     .rename(columns={"validation_score": "avg_validation_score"})
 )
@@ -465,6 +536,82 @@ plt.show()
 """
     ),
     markdown_cell(
+        """## Section 5.5 - Static versus regime-conditioned DRMV inputs
+
+The regime-conditioned branch needs to earn its place empirically. This comparison isolates three ways of feeding state-aware inputs into DRMV on a recent, targeted rebalance sample so the attribution is easier to read:
+
+- regime-conditioned mean only
+- regime-conditioned covariance only
+- both together
+
+That helps distinguish whether the current gain is coming from state-aware covariance, state-aware mean, or their combination.
+"""
+    ),
+    code_cell(
+        """drmv_input_strategies = {
+    "drmv_regularized_min_var": drmv_regularized_strategy,
+    "drmv_regime_mean_min_var": drmv_regime_mean_strategy,
+    "drmv_regime_covariance_min_var": drmv_regime_covariance_strategy,
+    "drmv_regime_conditioned_min_var": drmv_regime_conditioned_strategy,
+}
+
+regime_input_config = CONFIG.to_dict()
+regime_input_config["rebalance_freq"] = CONFIG.rebalance_freq * 2
+regime_input_returns = simple_returns.loc["2018-01-01":].copy()
+
+drmv_input_artifacts = backtest.run_rolling_backtest(
+    simple_returns=regime_input_returns,
+    strategies=drmv_input_strategies,
+    config=regime_input_config,
+)
+
+drmv_input_summary = backtest.summarize_backtest(
+    daily_returns=drmv_input_artifacts["daily_returns"],
+    gross_daily_returns=drmv_input_artifacts["gross_daily_returns"],
+    weights_history=drmv_input_artifacts["weights_history"],
+    rebalance_results=drmv_input_artifacts["rebalance_results"],
+)
+
+drmv_input_rebalances = drmv_input_artifacts["rebalance_results"]
+stress_split = pd.qcut(
+    drmv_input_rebalances["stressed_probability"].fillna(0.0).rank(method="first"),
+    q=3,
+    labels=["low_stress", "mid_stress", "high_stress"],
+)
+stress_conditionals = (
+    drmv_input_rebalances.assign(stress_bucket=stress_split)
+    .groupby(["strategy", "stress_bucket"])[["turnover", "binding_margin", "realized_vol", "forecast_vol"]]
+    .mean()
+)
+drmv_tradeoff = drmv_input_summary[
+    [
+        "annualized_return",
+        "sharpe_ratio",
+        "max_drawdown",
+        "average_turnover",
+        "forecast_realized_risk_gap",
+        "constraint_binding_frequency",
+        "average_chosen_delta",
+    ]
+]
+
+display(drmv_tradeoff)
+display(stress_conditionals)
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), sharex=False)
+drmv_tradeoff["sharpe_ratio"].sort_values().plot(kind="barh", ax=axes[0], color="#1f77b4")
+axes[0].set_title("DRMV Input Comparison: Sharpe")
+
+drmv_tradeoff["average_turnover"].sort_values().plot(kind="barh", ax=axes[1], color="#ff7f0e")
+axes[1].set_title("DRMV Input Comparison: Turnover")
+
+drmv_tradeoff["forecast_realized_risk_gap"].sort_values().plot(kind="barh", ax=axes[2], color="#2ca02c")
+axes[2].set_title("DRMV Input Comparison: Risk Gap")
+plt.tight_layout()
+plt.show()
+"""
+    ),
+    markdown_cell(
         """## Section 6 - Sensitivity analysis
 
 A robustness story is stronger when it measures weight sensitivity directly. The next block samples several rebalance dates and perturbs the training data in multiple ways, so the comparison is not hanging on one convenient snapshot.
@@ -492,6 +639,7 @@ sensitivity_table = backtest.run_sensitivity_scenarios(
         "sample_mean_variance": sample_mean_variance_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
         "drmv_regularized_min_var": drmv_regularized_strategy,
+        "drmv_regime_conditioned_min_var": drmv_regime_conditioned_strategy,
     },
     config=CONFIG,
     rebalance_dates=sampled_dates,
@@ -502,8 +650,27 @@ sensitivity_summary = (
     sensitivity_table.groupby("strategy")[["weight_l1_change", "concentration_change", "top_3_share_change", "forecast_vol_change"]]
     .agg(["mean", "max"])
 )
+paper_aligned_sensitivity = (
+    sensitivity_table[sensitivity_table["strategy"].isin(["sample_mean_variance", "drmv_regularized_min_var", "drmv_regime_conditioned_min_var"])]
+    .groupby("strategy")[["weight_l1_change", "forecast_vol_change", "concentration_change"]]
+    .mean()
+    .sort_values("weight_l1_change")
+)
+clear_result = pd.DataFrame(
+    {
+        "question": ["DRMV more stable than sample mean-variance under perturbations?"],
+        "sample_mean_variance_avg_l1": [paper_aligned_sensitivity.loc["sample_mean_variance", "weight_l1_change"]],
+        "drmv_regularized_avg_l1": [paper_aligned_sensitivity.loc["drmv_regularized_min_var", "weight_l1_change"]],
+        "drmv_regime_avg_l1": [paper_aligned_sensitivity.loc["drmv_regime_conditioned_min_var", "weight_l1_change"]],
+        "drmv_beats_sample_mv": [
+            bool(paper_aligned_sensitivity.loc["drmv_regularized_min_var", "weight_l1_change"] < paper_aligned_sensitivity.loc["sample_mean_variance", "weight_l1_change"])
+        ],
+    }
+)
 display(sensitivity_table.sort_values(["rebalance_date", "perturbation", "weight_l1_change"], ascending=[True, True, False]).head(20))
 display(sensitivity_summary)
+display(paper_aligned_sensitivity)
+display(clear_result)
 """
     ),
     markdown_cell(
@@ -542,6 +709,7 @@ noise_summary = backtest.run_corruption_stress(
         "sample_mean_variance": sample_mean_variance_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
         "drmv_regularized_min_var": drmv_regularized_strategy,
+        "drmv_regime_conditioned_min_var": drmv_regime_conditioned_strategy,
     },
     corruption_scenarios=corruption_scenarios,
     config=CONFIG,
@@ -773,6 +941,7 @@ for epsilon in appendix_epsilons:
             "expected_log_return": result["expected_log_return"],
             "worst_case_log_return": result["worst_case_log_return"],
             "log_growth_vol": result["log_growth_vol"],
+            "effective_n": float(1.0 / np.square(result["weights"]).sum()),
             "status": result["status"],
         }
     )
@@ -784,15 +953,19 @@ appendix_weight_frame = pd.DataFrame(appendix_weights).fillna(0.0)
 display(appendix_summary)
 display(appendix_weight_frame)
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 appendix_summary.plot(x="epsilon", y=["expected_log_return", "worst_case_log_return"], marker="o", ax=axes[0])
 axes[0].set_title("Log-Return Proxy vs Epsilon")
 axes[0].set_ylabel("Mean log-return proxy")
 
-appendix_weight_frame.plot(kind="bar", ax=axes[1])
-axes[1].set_title("Log-Return Proxy Weights")
-axes[1].set_ylabel("Weight")
-axes[1].tick_params(axis="x", rotation=45)
+appendix_summary.plot(x="epsilon", y="effective_n", marker="o", ax=axes[1], color="#2ca02c")
+axes[1].set_title("Diversification vs Ambiguity Radius")
+axes[1].set_ylabel("Effective number of holdings")
+
+appendix_weight_frame.plot(kind="bar", ax=axes[2])
+axes[2].set_title("Log-Return Proxy Weights")
+axes[2].set_ylabel("Weight")
+axes[2].tick_params(axis="x", rotation=45)
 plt.tight_layout()
 plt.show()
 """
@@ -952,8 +1125,8 @@ The revised project supports a stronger and more honest story than the original 
 2. Soft feasibility makes the optimization workflow diagnosable: target tension shows up as **slack**, not silent failure.
 3. Historical stress summaries are now methodologically correct because governance metrics are filtered to the same window as returns.
 4. The new DRMV branch is closer to the regularized DR mean-variance literature and gives us a cleaner ambiguity parameter (`delta`) plus a conservative robust target (`alpha_bar`) to track in validation.
-5. Regime-conditioned DRMV inputs create a practical bridge from market-state inference to portfolio construction, even though the regime engine remains a lightweight approximation rather than a full factor-model implementation.
-6. Corruption-aware experiments and direct sensitivity analysis support a stability-measurement narrative better than raw Sharpe alone, but the automated noisy-input regression check should still be treated as an empirical test rather than a foregone conclusion.
+5. Regime-conditioned DRMV inputs create a practical bridge from market-state inference to portfolio construction, and the notebook now compares regime-conditioned mean, covariance, and both together rather than treating the regime branch as a black box.
+6. Corruption-aware experiments and direct sensitivity analysis support a stability-measurement narrative better than raw Sharpe alone, with the clearest paper-aligned result coming from perturbation stability versus fragile sample mean-variance, but the automated noisy-input regression check should still be treated as an empirical test rather than a foregone conclusion.
 7. The optional Kelly-style appendix moves the uncertainty model into **log-return space**, but it is still a tractable proxy rather than the paper's exact Wasserstein-Kelly reformulation.
 8. The monitoring layer is best understood as a **prototype governance workflow** with calibration and alert diagnostics, not a predictive alpha claim.
 9. The heuristic regime-tagging extension is intentionally narrow: it helps condition diagnostics on market state, but its high accuracy mainly reflects recovery of a hand-crafted labeling rule, not a standalone predictive edge.

@@ -97,6 +97,10 @@ def estimate_regime_conditioned_inputs(
     regime_probs: pd.DataFrame | None = None,
     lookback: int = 252,
     covariance_method: str = "ledoit_wolf",
+    calm_covariance_method: str | None = None,
+    stressed_covariance_method: str | None = None,
+    probability_temperature: float = 1.0,
+    stressed_probability_threshold: float = 0.0,
 ) -> dict[str, object]:
     """
     Estimate current regime-conditioned mean returns and covariance.
@@ -124,6 +128,7 @@ def estimate_regime_conditioned_inputs(
     if not probability_columns:
         raise ValueError("Regime probability frame does not contain probability columns.")
 
+    stressed_state = int(aligned_probs["stressed_state"].iloc[-1]) if "stressed_state" in aligned_probs else 0
     state_means: dict[str, pd.Series] = {}
     state_covariances: dict[str, np.ndarray] = {}
     values = aligned_returns.to_numpy()
@@ -137,11 +142,23 @@ def estimate_regime_conditioned_inputs(
         state_mean = pd.Series(_weighted_mean(values, state_weights), index=aligned_returns.columns, name=probability_column)
         state_cov = _weighted_covariance(values, state_weights)
         state_means[probability_column] = state_mean
+        state_index = int(probability_column.split("_")[1])
+        if covariance_method == "state_aware":
+            selected_covariance_method = (
+                stressed_covariance_method if state_index == stressed_state else calm_covariance_method
+            ) or "ledoit_wolf"
+        else:
+            selected_covariance_method = covariance_method
         state_covariances[probability_column] = (
-            estimate_covariance_matrix(aligned_returns, method=covariance_method) if np.isnan(state_cov).any() else ensure_psd(state_cov)
+            estimate_covariance_matrix(aligned_returns, method=selected_covariance_method)
+            if np.isnan(state_cov).any() or selected_covariance_method != "sample"
+            else ensure_psd(state_cov)
         )
 
     latest_probabilities = aligned_probs[probability_columns].iloc[-1]
+    if probability_temperature != 1.0:
+        sharpened = np.power(np.clip(latest_probabilities.to_numpy(dtype=float), 1e-12, 1.0), float(probability_temperature))
+        latest_probabilities = pd.Series(sharpened / sharpened.sum(), index=latest_probabilities.index)
     mixture_mean = sum(float(latest_probabilities[column]) * state_means[column] for column in probability_columns)
     mixture_covariance = np.zeros((aligned_returns.shape[1], aligned_returns.shape[1]), dtype=float)
     for column in probability_columns:
@@ -150,15 +167,18 @@ def estimate_regime_conditioned_inputs(
         mean_gap = state_mean_vector - mixture_mean.reindex(aligned_returns.columns).to_numpy()
         mixture_covariance += float(latest_probabilities[column]) * (state_covariance + np.outer(mean_gap, mean_gap))
 
-    stressed_state = int(aligned_probs["stressed_state"].iloc[-1]) if "stressed_state" in aligned_probs else 0
     latest_regime = int(aligned_probs["most_likely_regime"].iloc[-1])
     stressed_probability = float(aligned_probs[f"regime_{stressed_state}_prob"].iloc[-1])
+    stress_activation = float(
+        np.clip((stressed_probability - stressed_probability_threshold) / max(1.0 - stressed_probability_threshold, 1e-12), 0.0, 1.0)
+    )
 
     return {
         "mean_returns": mixture_mean.rename("regime_conditioned_mean"),
         "covariance": ensure_psd(mixture_covariance),
         "latest_regime": latest_regime,
         "stressed_probability": stressed_probability,
+        "stress_activation": stress_activation,
         "regime_probabilities": aligned_probs,
         "state_means": state_means,
         "state_covariances": state_covariances,

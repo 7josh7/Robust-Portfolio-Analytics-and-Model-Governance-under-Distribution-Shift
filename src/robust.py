@@ -71,7 +71,7 @@ def solve_wasserstein_proxy_min_var(
     turnover_penalty: float = 0.0,
     slack_penalty: float = 10.0,
     allow_slack: bool = True,
-    solver: str = "SCS",
+    solver: str = "ECOS",
     rebalance_date: pd.Timestamp | None = None,
 ) -> dict[str, Any]:
     """
