@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from src import backtest, baselines, data, features, regime, reporting, robust  # noqa: E402
+from src.config import BacktestConfig  # noqa: E402
+
+
+def equal_weight_strategy(train_returns, val_returns, previous_weights, config):
+    return baselines.fit_equal_weight(train_returns)
+
+
+def inverse_vol_strategy(train_returns, val_returns, previous_weights, config):
+    return baselines.fit_inverse_volatility(train_returns)
+
+
+def sample_min_var_strategy(train_returns, val_returns, previous_weights, config):
+    return baselines.fit_sample_min_variance(
+        train_returns=train_returns,
+        target_return=None,
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+    )
+
+
+def shrinkage_min_var_strategy(train_returns, val_returns, previous_weights, config):
+    return baselines.fit_shrinkage_min_variance(
+        train_returns=train_returns,
+        target_return=None,
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+    )
+
+
+def sample_mean_variance_strategy(train_returns, val_returns, previous_weights, config):
+    return baselines.fit_sample_mean_variance(
+        train_returns=train_returns,
+        bounds=(tuple(config["bounds"])[0], 0.35),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+        risk_aversion=4.0,
+    )
+
+
+def wasserstein_proxy_strategy(train_returns, val_returns, previous_weights, config):
+    return robust.tune_wasserstein_proxy_radius(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        epsilon_grid=config["wasserstein_proxy_radius_grid"],
+        covariance_method=config["covariance_method"],
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+        slack_penalty=config["slack_penalty"],
+        metric=config["robust_validation_metric"],
+        target_return_mode=config["target_return_mode"],
+        target_return_scale=config["target_return_scale"],
+        target_return_quantile=config["target_return_quantile"],
+        fixed_target_return=config["fixed_target_return"],
+        previous_epsilon=config.get("previous_epsilon"),
+        selection_slack_penalty_weight=config["selection_slack_penalty_weight"],
+        selection_turnover_penalty_weight=config["selection_turnover_penalty_weight"],
+        selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
+        selection_epsilon_change_penalty_weight=config["selection_epsilon_change_penalty_weight"],
+        rebalance_date=config.get("rebalance_date"),
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the robust portfolio analytics backtest.")
+    parser.add_argument("--config", default="configs/base.yaml", help="Path to the YAML config file.")
+    args = parser.parse_args()
+
+    config = BacktestConfig.from_yaml(PROJECT_ROOT / args.config)
+    universe = data.DEFAULT_UNIVERSE[: config.target_universe_size]
+
+    prices_raw = data.load_or_download_price_data(
+        tickers=universe,
+        start=config.start_date,
+        end=config.end_date,
+        raw_data_path=PROJECT_ROOT / config.raw_data_path,
+        auto_adjust=True,
+        progress=False,
+        refresh=config.refresh_data,
+    )
+    prices = data.clean_price_panel(prices_raw, max_missing_frac=0.05, forward_fill_limit=3)
+    bundle = data.compute_returns(prices)
+
+    strategies = {
+        "equal_weight": equal_weight_strategy,
+        "inverse_vol": inverse_vol_strategy,
+        "sample_min_var": sample_min_var_strategy,
+        "shrinkage_min_var": shrinkage_min_var_strategy,
+        "sample_mean_variance": sample_mean_variance_strategy,
+        "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
+    }
+    artifacts = backtest.run_rolling_backtest(bundle.simple_returns, strategies, config)
+    summary = backtest.summarize_backtest(
+        daily_returns=artifacts["daily_returns"],
+        gross_daily_returns=artifacts["gross_daily_returns"],
+        weights_history=artifacts["weights_history"],
+        rebalance_results=artifacts["rebalance_results"],
+    )
+
+    output_dir = PROJECT_ROOT / "outputs" / "cli_run"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(output_dir / "summary.csv")
+    artifacts["rebalance_results"].to_csv(output_dir / "rebalance_results.csv")
+    artifacts["daily_returns"].to_csv(output_dir / "daily_returns_net.csv")
+    artifacts["gross_daily_returns"].to_csv(output_dir / "daily_returns_gross.csv")
+    reporting.save_weights_history(artifacts["weights_history"], output_dir)
+    reporting.save_weights_history(artifacts["proposed_weights_history"], output_dir / "proposed_weights")
+    reporting.save_diagnostics_json(
+        reporting.build_diagnostics_payload(config, summary, artifacts["rebalance_results"]),
+        output_dir / "diagnostics.json",
+    )
+    reporting.save_backtest_figures(
+        daily_returns=artifacts["daily_returns"],
+        rebalance_results=artifacts["rebalance_results"],
+        weights_history=artifacts["weights_history"],
+        output_dir=output_dir / "figures",
+    )
+
+    proxy_rebalances = artifacts["rebalance_results"][artifacts["rebalance_results"]["strategy"] == "wasserstein_proxy_min_var"].copy()
+    proxy_weights = artifacts["weights_history"]["wasserstein_proxy_min_var"].copy()
+    regime_features = features.build_instability_feature_frame(
+        simple_returns=bundle.simple_returns,
+        weights_history=proxy_weights,
+        rebalance_results=proxy_rebalances,
+        lookback=config.monitoring_lookback,
+        include_optional_features=True,
+    )
+    regime_labels = regime.build_regime_labels(
+        regime_features,
+        vol_quantile=config.regime_label_quantile,
+        corr_quantile=config.regime_label_quantile,
+        drawdown_quantile=config.regime_label_quantile,
+        dispersion_quantile=config.regime_label_quantile,
+    )
+    regime_result = regime.train_regime_classifier(
+        feature_frame=regime_features[regime.DEFAULT_REGIME_FEATURE_COLUMNS].dropna(),
+        target=regime_labels,
+        model_type=config.regime_model_type,
+        test_fraction=config.regime_test_fraction,
+        random_state=config.seed,
+    )
+    regime_output_dir = output_dir / "regime"
+    regime_output_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([regime_result["metrics"]]).to_csv(regime_output_dir / "metrics.csv", index=False)
+    regime_result["confusion_matrix"].to_csv(regime_output_dir / "confusion_matrix.csv")
+    regime_result["feature_importance"].to_csv(regime_output_dir / "feature_importance.csv", index=False)
+    regime_result["predictions"].to_csv(regime_output_dir / "predictions.csv")
+    regime.summarize_regime_conditionals(
+        rebalance_results=artifacts["rebalance_results"],
+        regime_predictions=regime_result["predictions"],
+        strategy="wasserstein_proxy_min_var",
+        regime_column="predicted_regime",
+    ).to_csv(regime_output_dir / "conditional_summary.csv")
+
+    print(summary.round(4))
+    print(f"\nSaved outputs to {output_dir}")
+
+
+if __name__ == "__main__":
+    main()

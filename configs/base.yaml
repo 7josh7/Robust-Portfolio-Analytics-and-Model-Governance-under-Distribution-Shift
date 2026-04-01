@@ -1,0 +1,42 @@
+seed: 7
+start_date: "2012-01-01"
+end_date: "2025-12-31"
+train_window: 756
+val_window: 252
+rebalance_freq: 21
+transaction_cost_bps: 5.0
+target_universe_size: 12
+fixed_target_return: 0.0002
+target_return_mode: "equal_weight_fraction"
+target_return_scale: 0.50
+target_return_quantile: 0.40
+bounds: [0.0, 0.25]
+turnover_penalty: 0.001
+no_trade_band_l1: 0.05
+full_rebalance_band_l1: 0.20
+covariance_method: "ledoit_wolf"
+monitoring_lookback: 63
+regime_model_type: "random_forest"
+regime_test_fraction: 0.30
+regime_label_quantile: 0.67
+slack_penalty: 10.0
+robust_validation_metric: "composite"
+selection_slack_penalty_weight: 5.0
+selection_turnover_penalty_weight: 1.0
+selection_risk_gap_penalty_weight: 2.0
+selection_epsilon_change_penalty_weight: 5.0
+raw_data_path: "data/raw_prices.parquet"
+large_universe_raw_data_path: "data/large_universe_raw_prices.parquet"
+refresh_data: false
+large_universe_size: 30
+sensitivity_rebalance_samples: 5
+wasserstein_proxy_radius_grid:
+  - 0.0
+  - 0.0001
+  - 0.00025
+  - 0.0005
+  - 0.001
+  - 0.0025
+  - 0.005
+  - 0.01
+  - 0.02

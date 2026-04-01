@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+outputs/
+data/raw_prices.parquet
+data/large_universe_raw_prices.parquet
