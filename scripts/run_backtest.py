@@ -107,42 +107,106 @@ def drmv_regularized_strategy(train_returns, val_returns, previous_weights, conf
         selection_sensitivity_penalty_weight=config["selection_sensitivity_penalty_weight"],
         selection_corruption_penalty_weight=config["selection_corruption_penalty_weight"],
         selection_stress_penalty_weight=config["selection_stress_penalty_weight"],
+        selection_concentration_penalty_weight=config["selection_concentration_penalty_weight"],
+        selection_drawdown_penalty_weight=config["selection_drawdown_penalty_weight"],
         mean_perturbation_scale=config["selection_mean_perturbation_scale"],
         covariance_perturbation_scale=config["selection_covariance_perturbation_scale"],
         corruption_noise_scale=config["selection_corruption_noise_scale"],
         stress_quantile=config["selection_stress_quantile"],
         selection_sensitivity_top_k=config["selection_sensitivity_top_k"],
         metric=config["robust_validation_metric"],
+        calibration_mode=config["drmv_calibration_mode"],
+        objective_mode=config["drmv_objective_mode"],
         rebalance_date=config.get("rebalance_date"),
     )
 
 
-def _build_regime_conditioned_drmv_result(train_returns, val_returns, previous_weights, config, input_mode="both"):
+def drmv_paper_reference_strategy(train_returns, val_returns, previous_weights, config):
+    return selection.tune_drmv_regularized_min_variance(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        delta_grid=config["drmv_delta_grid"],
+        alpha_bar_scale_grid=config["drmv_paper_reference_alpha_bar_scale_grid"],
+        covariance_methods=config["drmv_covariance_methods"],
+        bounds=tuple(config["bounds"]),
+        previous_weights=previous_weights,
+        turnover_penalty=config["turnover_penalty"],
+        p_norm=config["drmv_p_norm"],
+        target_method=config["drmv_target_method"],
+        target_scale=config["drmv_target_scale"],
+        target_quantile=config["target_return_quantile"],
+        fixed_target_return=config["fixed_target_return"],
+        alpha_bar_rule=config["drmv_alpha_bar_rule"],
+        selection_turnover_penalty_weight=config["selection_turnover_penalty_weight"],
+        selection_risk_gap_penalty_weight=config["selection_risk_gap_penalty_weight"],
+        selection_constraint_penalty_weight=config["selection_constraint_penalty_weight"],
+        selection_fallback_penalty_weight=config["selection_fallback_penalty_weight"],
+        selection_sensitivity_penalty_weight=config["selection_sensitivity_penalty_weight"],
+        selection_corruption_penalty_weight=config["selection_corruption_penalty_weight"],
+        selection_stress_penalty_weight=config["selection_stress_penalty_weight"],
+        selection_concentration_penalty_weight=config["selection_concentration_penalty_weight"],
+        selection_drawdown_penalty_weight=config["selection_drawdown_penalty_weight"],
+        mean_perturbation_scale=config["selection_mean_perturbation_scale"],
+        covariance_perturbation_scale=config["selection_covariance_perturbation_scale"],
+        corruption_noise_scale=config["selection_corruption_noise_scale"],
+        stress_quantile=config["selection_stress_quantile"],
+        selection_sensitivity_top_k=config["selection_sensitivity_top_k"],
+        metric=config["robust_validation_metric"],
+        calibration_mode="paper_reference",
+        objective_mode="paper_alignment",
+        rebalance_date=config.get("rebalance_date"),
+    )
+
+
+def _build_regime_conditioned_drmv_result(
+    train_returns,
+    val_returns,
+    previous_weights,
+    config,
+    input_mode="both",
+    regime_engine="mixture",
+    calibration_mode="practical",
+    objective_mode="production",
+):
     regime_inputs = selection.prepare_regime_conditioned_inputs(
         train_returns=train_returns,
         lookback=config["regime_lookback"],
         n_regimes=config["regime_states"],
+        regime_engine=regime_engine,
         covariance_method=config["regime_covariance_method"],
         calm_covariance_method=config["regime_calm_covariance_method"],
         stressed_covariance_method=config["regime_stressed_covariance_method"],
         probability_temperature=config["regime_probability_temperature"],
         stressed_probability_threshold=config["regime_probability_threshold"],
+        switching_variance=config["regime_switching_variance"],
+        current_probability_mode=config["regime_current_probability_mode"],
+        estimation_probability_mode=config["regime_estimation_probability_mode"],
         random_state=config["seed"],
     )
-    overrides = selection.build_regime_search_overrides(
-        delta_grid=config["drmv_delta_grid"],
-        turnover_penalty=config["turnover_penalty"],
-        stress_activation=regime_inputs["stress_activation"],
-        stressed_delta_grid_multiplier=config["regime_stressed_delta_grid_multiplier"],
-        stressed_turnover_multiplier=config["regime_stressed_turnover_multiplier"],
-    )
+    if calibration_mode == "practical":
+        overrides = selection.build_regime_search_overrides(
+            delta_grid=config["drmv_delta_grid"],
+            turnover_penalty=config["turnover_penalty"],
+            stress_activation=regime_inputs["stress_activation"],
+            stressed_delta_grid_multiplier=config["regime_stressed_delta_grid_multiplier"],
+            stressed_turnover_multiplier=config["regime_stressed_turnover_multiplier"],
+        )
+    else:
+        overrides = {
+            "delta_grid": config["drmv_delta_grid"],
+            "turnover_penalty": config["turnover_penalty"],
+        }
     mean_vector = regime_inputs["mean_returns"] if input_mode in {"mean", "both"} else None
     covariance_matrix = regime_inputs["covariance"] if input_mode in {"covariance", "both"} else None
-    return selection.tune_drmv_regularized_min_variance(
+    result = selection.tune_drmv_regularized_min_variance(
         train_returns=train_returns,
         val_returns=val_returns,
         delta_grid=overrides["delta_grid"],
-        alpha_bar_scale_grid=config["drmv_alpha_bar_scale_grid"],
+        alpha_bar_scale_grid=(
+            config["drmv_paper_reference_alpha_bar_scale_grid"]
+            if calibration_mode == "paper_reference"
+            else config["drmv_alpha_bar_scale_grid"]
+        ),
         covariance_methods=config["drmv_covariance_methods"],
         bounds=tuple(config["bounds"]),
         previous_weights=previous_weights,
@@ -160,6 +224,8 @@ def _build_regime_conditioned_drmv_result(train_returns, val_returns, previous_w
         selection_sensitivity_penalty_weight=config["selection_sensitivity_penalty_weight"],
         selection_corruption_penalty_weight=config["selection_corruption_penalty_weight"],
         selection_stress_penalty_weight=config["selection_stress_penalty_weight"],
+        selection_concentration_penalty_weight=config["selection_concentration_penalty_weight"],
+        selection_drawdown_penalty_weight=config["selection_drawdown_penalty_weight"],
         mean_perturbation_scale=config["selection_mean_perturbation_scale"],
         covariance_perturbation_scale=config["selection_covariance_perturbation_scale"],
         corruption_noise_scale=config["selection_corruption_noise_scale"],
@@ -172,8 +238,18 @@ def _build_regime_conditioned_drmv_result(train_returns, val_returns, previous_w
         stressed_probability=regime_inputs["stress_activation"],
         stressed_target_scale=config["regime_stressed_target_scale"],
         stressed_delta_scale=config["regime_stressed_delta_scale"],
+        calibration_mode=calibration_mode,
+        objective_mode=objective_mode,
         rebalance_date=config.get("rebalance_date"),
     )
+    result.update(
+        {
+            "regime_model_version": regime_inputs.get("regime_model_version", regime_engine),
+            "regime_model_status": regime_inputs.get("regime_model_status", "trained"),
+            "probability_mode": regime_inputs.get("probability_mode", regime_engine),
+        }
+    )
+    return result
 
 
 def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weights, config):
@@ -183,6 +259,9 @@ def drmv_regime_conditioned_strategy(train_returns, val_returns, previous_weight
         previous_weights=previous_weights,
         config=config,
         input_mode="both",
+        regime_engine="mixture",
+        calibration_mode="practical",
+        objective_mode="production",
     )
 
 
@@ -193,6 +272,9 @@ def drmv_regime_mean_strategy(train_returns, val_returns, previous_weights, conf
         previous_weights=previous_weights,
         config=config,
         input_mode="mean",
+        regime_engine="mixture",
+        calibration_mode="practical",
+        objective_mode="production",
     )
 
 
@@ -203,6 +285,35 @@ def drmv_regime_covariance_strategy(train_returns, val_returns, previous_weights
         previous_weights=previous_weights,
         config=config,
         input_mode="covariance",
+        regime_engine="mixture",
+        calibration_mode="practical",
+        objective_mode="production",
+    )
+
+
+def drmv_regime_covariance_hmm_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="covariance",
+        regime_engine="hmm",
+        calibration_mode="practical",
+        objective_mode="paper_alignment",
+    )
+
+
+def drmv_regime_conditioned_hmm_strategy(train_returns, val_returns, previous_weights, config):
+    return _build_regime_conditioned_drmv_result(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        previous_weights=previous_weights,
+        config=config,
+        input_mode="both",
+        regime_engine="hmm",
+        calibration_mode="practical",
+        objective_mode="paper_alignment",
     )
 
 
@@ -234,7 +345,11 @@ def main() -> None:
         "sample_mean_variance": sample_mean_variance_strategy,
         "wasserstein_proxy_min_var": wasserstein_proxy_strategy,
         "drmv_regularized_min_var": drmv_regularized_strategy,
+        "drmv_paper_reference_min_var": drmv_paper_reference_strategy,
         "drmv_regime_conditioned_min_var": drmv_regime_conditioned_strategy,
+        "drmv_regime_covariance_min_var_mixture": drmv_regime_covariance_strategy,
+        "drmv_regime_covariance_min_var_hmm": drmv_regime_covariance_hmm_strategy,
+        "drmv_regime_conditioned_min_var_hmm": drmv_regime_conditioned_hmm_strategy,
     }
     artifacts = backtest.run_rolling_backtest(bundle.simple_returns, strategies, config)
     summary = backtest.summarize_backtest(

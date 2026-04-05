@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import cvxpy as cp
@@ -22,6 +23,32 @@ from .targets import build_nominal_target
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _WassersteinProxyDppProgram:
+    problem: cp.Problem
+    weights: cp.Variable
+    slack: cp.Variable
+    sqrt_covariance: Any
+    mean_returns: cp.Parameter
+    epsilon: cp.Parameter
+    target_return: cp.Parameter
+    previous_weights: cp.Parameter
+    turnover_penalty: cp.Parameter
+    slack_penalty: cp.Parameter
+
+
+@dataclass(slots=True)
+class _DrmvDppProgram:
+    problem: cp.Problem
+    weights: cp.Variable
+    sqrt_covariance: Any
+    mean_returns: cp.Parameter
+    sqrt_delta: cp.Parameter
+    alpha_bar: cp.Parameter
+    previous_weights: cp.Parameter
+    turnover_penalty: cp.Parameter
 
 
 def _selection_turnover(weights: pd.Series, previous_weights: pd.Series | None) -> float:
@@ -59,6 +86,98 @@ def _resolve_mean_and_covariance(
     return resolved_mean, ensure_psd(resolved_covariance)
 
 
+def _matrix_square_root(covariance: np.ndarray) -> np.ndarray:
+    covariance_psd = ensure_psd(covariance)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance_psd)
+    eigenvalues = np.clip(eigenvalues, 0.0, None)
+    return np.diag(np.sqrt(eigenvalues)) @ eigenvectors.T
+
+
+def _build_wasserstein_proxy_dpp_program(
+    covariance_factor: np.ndarray,
+    lower_bound: float,
+    upper_bound: float,
+) -> _WassersteinProxyDppProgram:
+    n_assets = covariance_factor.shape[1]
+    w = cp.Variable(n_assets)
+    s = cp.Variable(nonneg=True)
+    robust_radius = cp.Variable(nonneg=True)
+    turnover_abs = cp.Variable(n_assets, nonneg=True)
+    mean_returns = cp.Parameter(n_assets, value=np.zeros(n_assets))
+    epsilon = cp.Parameter(nonneg=True, value=0.0)
+    target_return = cp.Parameter(value=0.0)
+    previous_weights = cp.Parameter(n_assets, value=np.zeros(n_assets))
+    turnover_penalty = cp.Parameter(nonneg=True, value=0.0)
+    slack_penalty = cp.Parameter(nonneg=True, value=1.0)
+
+    objective = cp.sum_squares(covariance_factor @ w) + slack_penalty * s + turnover_penalty * cp.sum(turnover_abs)
+    constraints = [
+        cp.sum(w) == 1.0,
+        w >= lower_bound,
+        w <= upper_bound,
+        cp.norm(w, 2) <= robust_radius,
+        turnover_abs >= w - previous_weights,
+        turnover_abs >= previous_weights - w,
+        mean_returns @ w - epsilon * robust_radius + s >= target_return,
+    ]
+    problem = cp.Problem(cp.Minimize(objective), constraints)
+    if not problem.is_dpp():
+        raise ValueError("Wasserstein proxy DPP program is not DPP-compliant.")
+    return _WassersteinProxyDppProgram(
+        problem=problem,
+        weights=w,
+        slack=s,
+        sqrt_covariance=covariance_factor,
+        mean_returns=mean_returns,
+        epsilon=epsilon,
+        target_return=target_return,
+        previous_weights=previous_weights,
+        turnover_penalty=turnover_penalty,
+        slack_penalty=slack_penalty,
+    )
+
+
+def _build_drmv_dpp_program(
+    covariance_factor: np.ndarray,
+    lower_bound: float,
+    upper_bound: float,
+    p_norm: int | float,
+) -> _DrmvDppProgram:
+    n_assets = covariance_factor.shape[1]
+    w = cp.Variable(n_assets)
+    robust_radius = cp.Variable(nonneg=True)
+    turnover_abs = cp.Variable(n_assets, nonneg=True)
+    mean_returns = cp.Parameter(n_assets, value=np.zeros(n_assets))
+    sqrt_delta = cp.Parameter(nonneg=True, value=0.0)
+    alpha_bar = cp.Parameter(value=0.0)
+    previous_weights = cp.Parameter(n_assets, value=np.zeros(n_assets))
+    turnover_penalty = cp.Parameter(nonneg=True, value=0.0)
+
+    objective = cp.norm(covariance_factor @ w, 2) + sqrt_delta * robust_radius + turnover_penalty * cp.sum(turnover_abs)
+    constraints = [
+        cp.sum(w) == 1.0,
+        w >= lower_bound,
+        w <= upper_bound,
+        cp.norm(w, p_norm) <= robust_radius,
+        turnover_abs >= w - previous_weights,
+        turnover_abs >= previous_weights - w,
+        mean_returns @ w >= alpha_bar + sqrt_delta * robust_radius,
+    ]
+    problem = cp.Problem(cp.Minimize(objective), constraints)
+    if not problem.is_dpp():
+        raise ValueError("DRMV DPP program is not DPP-compliant.")
+    return _DrmvDppProgram(
+        problem=problem,
+        weights=w,
+        sqrt_covariance=covariance_factor,
+        mean_returns=mean_returns,
+        sqrt_delta=sqrt_delta,
+        alpha_bar=alpha_bar,
+        previous_weights=previous_weights,
+        turnover_penalty=turnover_penalty,
+    )
+
+
 def solve_wasserstein_proxy_min_var(
     train_returns: pd.DataFrame,
     epsilon: float,
@@ -66,6 +185,7 @@ def solve_wasserstein_proxy_min_var(
     covariance_method: str = "ledoit_wolf",
     mean_returns: pd.Series | None = None,
     covariance: np.ndarray | None = None,
+    covariance_factor: np.ndarray | None = None,
     bounds: tuple[float, float] = (0.0, 0.25),
     previous_weights: pd.Series | None = None,
     turnover_penalty: float = 0.0,
@@ -73,6 +193,7 @@ def solve_wasserstein_proxy_min_var(
     allow_slack: bool = True,
     solver: str = "ECOS",
     rebalance_date: pd.Timestamp | None = None,
+    dpp_program: _WassersteinProxyDppProgram | None = None,
 ) -> dict[str, Any]:
     """
     Practical Wasserstein-inspired proxy min-variance allocation.
@@ -95,6 +216,7 @@ def solve_wasserstein_proxy_min_var(
         mean_returns=mean_returns,
         covariance=covariance,
     )
+    covariance_factor = covariance_factor if covariance_factor is not None else _matrix_square_root(covariance)
     lower_bound, upper_bound = bounds
 
     # At zero radius with a hard feasibility constraint, the proxy should
@@ -126,32 +248,46 @@ def solve_wasserstein_proxy_min_var(
         )
         return baseline
 
-    w = cp.Variable(len(assets))
-    s = cp.Variable(nonneg=True) if allow_slack else None
-
-    objective = cp.quad_form(w, ensure_psd(covariance))
-    if allow_slack:
-        objective += float(slack_penalty) * s
-    if previous_weights is not None and turnover_penalty > 0.0:
-        objective += turnover_penalty * cp.norm1(w - previous_weights.reindex(assets).fillna(0.0).to_numpy())
-
-    mu_vector = mu.reindex(assets).fillna(0.0).to_numpy()
-    if abs(float(epsilon)) <= 1e-15:
-        robust_return = mu_vector @ w
+    if dpp_program is not None and allow_slack:
+        dpp_program.mean_returns.value = mu.reindex(assets).fillna(0.0).to_numpy()
+        dpp_program.epsilon.value = max(float(epsilon), 0.0)
+        dpp_program.target_return.value = float(target_return)
+        dpp_program.previous_weights.value = (
+            previous_weights.reindex(assets).fillna(0.0).to_numpy() if previous_weights is not None else np.zeros(len(assets))
+        )
+        dpp_program.turnover_penalty.value = max(float(turnover_penalty), 0.0)
+        dpp_program.slack_penalty.value = max(float(slack_penalty), 0.0)
+        problem = dpp_program.problem
+        problem.solve(solver=solver, warm_start=True)
+        w = dpp_program.weights
+        s = dpp_program.slack
     else:
-        robust_return = mu_vector @ w - float(epsilon) * cp.norm(w, 2)
-    constraints = [
-        cp.sum(w) == 1.0,
-        w >= lower_bound,
-        w <= upper_bound,
-    ]
-    if allow_slack:
-        constraints.append(robust_return + s >= float(target_return))
-    else:
-        constraints.append(robust_return >= float(target_return))
+        w = cp.Variable(len(assets))
+        s = cp.Variable(nonneg=True) if allow_slack else None
 
-    problem = cp.Problem(cp.Minimize(objective), constraints)
-    problem.solve(solver=solver, warm_start=True)
+        objective = cp.quad_form(w, ensure_psd(covariance))
+        if allow_slack:
+            objective += float(slack_penalty) * s
+        if previous_weights is not None and turnover_penalty > 0.0:
+            objective += turnover_penalty * cp.norm1(w - previous_weights.reindex(assets).fillna(0.0).to_numpy())
+
+        mu_vector = mu.reindex(assets).fillna(0.0).to_numpy()
+        if abs(float(epsilon)) <= 1e-15:
+            robust_return = mu_vector @ w
+        else:
+            robust_return = mu_vector @ w - float(epsilon) * cp.norm(w, 2)
+        constraints = [
+            cp.sum(w) == 1.0,
+            w >= lower_bound,
+            w <= upper_bound,
+        ]
+        if allow_slack:
+            constraints.append(robust_return + s >= float(target_return))
+        else:
+            constraints.append(robust_return >= float(target_return))
+
+        problem = cp.Problem(cp.Minimize(objective), constraints)
+        problem.solve(solver=solver, warm_start=True)
 
     if w.value is None:
         fallback = fit_sample_min_variance(
@@ -189,7 +325,8 @@ def solve_wasserstein_proxy_min_var(
     weights = pd.Series(np.asarray(w.value).ravel(), index=assets, name="weight")
     weights = weights.clip(lower=0.0)
     weights = weights / weights.sum()
-    variance = float(weights.to_numpy() @ ensure_psd(covariance) @ weights.to_numpy())
+    covariance_psd = ensure_psd(covariance)
+    variance = float(weights.to_numpy() @ covariance_psd @ weights.to_numpy())
     slack_used = float(max(np.asarray(s.value).item(), 0.0)) if allow_slack and s is not None and s.value is not None else 0.0
     worst_case_return = float(mu @ weights - float(epsilon) * np.linalg.norm(weights.to_numpy(), ord=2))
     binding_margin = float(worst_case_return + slack_used - target_return)
@@ -253,8 +390,11 @@ def solve_drmv_regularized_min_variance(
     turnover_penalty: float = 0.0,
     allow_slack: bool = False,
     slack_penalty: float = 10.0,
-    solver: str = "SCS",
+    solver: str = "ECOS",
     rebalance_date: pd.Timestamp | None = None,
+    covariance_factor: np.ndarray | None = None,
+    dpp_program: _DrmvDppProgram | None = None,
+    paper_mode: str = "practical_tuned_drmv",
 ) -> dict[str, Any]:
     """
     Paper-aligned DR mean-variance branch with regularized volatility.
@@ -272,29 +412,42 @@ def solve_drmv_regularized_min_variance(
 
     assets = mean_returns.index
     covariance_psd = ensure_psd(covariance)
-    chol = np.linalg.cholesky(covariance_psd)
+    covariance_factor = covariance_factor if covariance_factor is not None else _matrix_square_root(covariance_psd)
     sqrt_delta = float(np.sqrt(max(delta, 0.0)))
 
-    w = cp.Variable(len(assets))
-    s = cp.Variable(nonneg=True) if allow_slack else None
-    robust_norm = cp.norm(w, p_norm)
-    objective = cp.norm(chol @ w, 2) + sqrt_delta * robust_norm
-    if previous_weights is not None and turnover_penalty > 0.0:
-        objective += turnover_penalty * cp.norm1(w - previous_weights.reindex(assets).fillna(0.0).to_numpy())
-    if allow_slack and s is not None:
-        objective += float(slack_penalty) * s
-
-    mu_vector = mean_returns.reindex(assets).fillna(0.0).to_numpy()
-    constraints = [cp.sum(w) == 1.0]
-    if long_only:
-        constraints.extend([w >= lower_bound, w <= upper_bound])
-    if allow_slack and s is not None:
-        constraints.append(mu_vector @ w + s >= float(alpha_bar) + sqrt_delta * robust_norm)
+    if dpp_program is not None and not allow_slack and long_only:
+        dpp_program.mean_returns.value = mean_returns.reindex(assets).fillna(0.0).to_numpy()
+        dpp_program.sqrt_delta.value = sqrt_delta
+        dpp_program.alpha_bar.value = float(alpha_bar)
+        dpp_program.previous_weights.value = (
+            previous_weights.reindex(assets).fillna(0.0).to_numpy() if previous_weights is not None else np.zeros(len(assets))
+        )
+        dpp_program.turnover_penalty.value = max(float(turnover_penalty), 0.0)
+        problem = dpp_program.problem
+        problem.solve(solver=solver, warm_start=True)
+        w = dpp_program.weights
+        s = None
     else:
-        constraints.append(mu_vector @ w >= float(alpha_bar) + sqrt_delta * robust_norm)
+        w = cp.Variable(len(assets))
+        s = cp.Variable(nonneg=True) if allow_slack else None
+        robust_norm = cp.norm(w, p_norm)
+        objective = cp.norm(covariance_factor @ w, 2) + sqrt_delta * robust_norm
+        if previous_weights is not None and turnover_penalty > 0.0:
+            objective += turnover_penalty * cp.norm1(w - previous_weights.reindex(assets).fillna(0.0).to_numpy())
+        if allow_slack and s is not None:
+            objective += float(slack_penalty) * s
 
-    problem = cp.Problem(cp.Minimize(objective), constraints)
-    problem.solve(solver=solver, warm_start=True)
+        mu_vector = mean_returns.reindex(assets).fillna(0.0).to_numpy()
+        constraints = [cp.sum(w) == 1.0]
+        if long_only:
+            constraints.extend([w >= lower_bound, w <= upper_bound])
+        if allow_slack and s is not None:
+            constraints.append(mu_vector @ w + s >= float(alpha_bar) + sqrt_delta * robust_norm)
+        else:
+            constraints.append(mu_vector @ w >= float(alpha_bar) + sqrt_delta * robust_norm)
+
+        problem = cp.Problem(cp.Minimize(objective), constraints)
+        problem.solve(solver=solver, warm_start=True)
 
     if w.value is None:
         fallback = solve_min_variance(
@@ -321,6 +474,7 @@ def solve_drmv_regularized_min_variance(
                 "fallback_used": True,
                 "soft_feasibility_enabled": bool(allow_slack),
                 "p_norm": float(p_norm),
+                "paper_mode": str(paper_mode),
             }
         )
         LOGGER.info(
@@ -368,6 +522,7 @@ def solve_drmv_regularized_min_variance(
         "fallback_used": False,
         "soft_feasibility_enabled": bool(allow_slack),
         "p_norm": float(p_norm),
+        "paper_mode": str(paper_mode),
     }
 
 
@@ -437,7 +592,7 @@ def tune_wasserstein_proxy_radius(
     selection_turnover_penalty_weight: float = 1.0,
     selection_risk_gap_penalty_weight: float = 2.0,
     selection_epsilon_change_penalty_weight: float = 5.0,
-    solver: str = "SCS",
+    solver: str = "ECOS",
     rebalance_date: pd.Timestamp | None = None,
 ) -> dict[str, Any]:
     """Grid-search the proxy robustness radius on a rolling validation window."""
@@ -454,9 +609,23 @@ def tune_wasserstein_proxy_radius(
         resolved_target = float(target_return)
         target_source = "explicit_target_return"
 
+    resolved_mean, resolved_covariance = _resolve_mean_and_covariance(
+        train_returns=train_returns,
+        covariance_method=covariance_method,
+        mean_returns=mean_returns,
+        covariance=covariance,
+    )
+    covariance_factor = _matrix_square_root(resolved_covariance)
+    dpp_program = _build_wasserstein_proxy_dpp_program(
+        covariance_factor=covariance_factor,
+        lower_bound=bounds[0],
+        upper_bound=bounds[1],
+    )
+
     best_result: dict[str, Any] | None = None
     best_score = -np.inf
     diagnostics_rows: list[dict[str, Any]] = []
+    val_returns_filled = val_returns.fillna(0.0)
 
     for epsilon in epsilon_grid:
         result = solve_wasserstein_proxy_min_var(
@@ -464,16 +633,18 @@ def tune_wasserstein_proxy_radius(
             epsilon=epsilon,
             target_return=resolved_target,
             covariance_method=covariance_method,
-            mean_returns=mean_returns,
-            covariance=covariance,
+            mean_returns=resolved_mean,
+            covariance=resolved_covariance,
+            covariance_factor=covariance_factor,
             bounds=bounds,
             previous_weights=previous_weights,
             turnover_penalty=turnover_penalty,
             slack_penalty=slack_penalty,
             solver=solver,
             rebalance_date=rebalance_date,
+            dpp_program=dpp_program,
         )
-        val_portfolio_returns = val_returns.fillna(0.0) @ result["weights"]
+        val_portfolio_returns = val_returns_filled @ result["weights"]
         validation_turnover = _selection_turnover(result["weights"], previous_weights)
         epsilon_change = abs(float(epsilon) - float(previous_epsilon)) if previous_epsilon is not None else 0.0
         score, score_components = _composite_validation_score(
@@ -600,6 +771,101 @@ def solve_log_return_growth_proxy(
         "log_growth_vol": float(np.sqrt(log_growth_variance) * np.sqrt(252)),
         "growth_risk_aversion": float(growth_risk_aversion),
         "chosen_epsilon": float(epsilon),
+    }
+
+
+def solve_wasserstein_kelly_exact_p2(
+    log_returns: pd.DataFrame,
+    epsilon: float,
+    bounds: tuple[float, float] = (0.0, 0.25),
+    solver: str = "SCS",
+    lambda_floor: float = 1e-8,
+) -> dict[str, Any]:
+    """
+    Closer-to-paper Wasserstein-Kelly appendix solver for p = 2.
+
+    This follows the convex reformulation in the Li paper for the Euclidean
+    Wasserstein metric:
+
+        max_{w, v^(j), lambda >= 0}
+            (1/N) sum_j [
+                r_j.T v^(j)
+                - 1/4 * lambda * ||v^(j) / lambda||_2^2
+                + sum_i v_i^(j) log(w_i / v_i^(j))
+            ]
+            - lambda * epsilon^2
+
+    under a long-only simplex constraint on ``w``.
+    """
+
+    if log_returns.empty:
+        raise ValueError("log_returns must contain at least one observation.")
+
+    assets = log_returns.columns
+    samples = log_returns.fillna(0.0).to_numpy(dtype=float)
+    n_samples, n_assets = samples.shape
+    lower_bound, upper_bound = bounds
+    weight_floor = max(float(lower_bound), 1e-8)
+
+    w = cp.Variable(n_assets)
+    v = cp.Variable((n_samples, n_assets), nonneg=True)
+    lambda_var = cp.Variable(nonneg=True)
+
+    objective_terms = []
+    for sample_idx in range(n_samples):
+        sample_vector = samples[sample_idx]
+        entropy_term = -cp.sum(cp.rel_entr(v[sample_idx, :], w))
+        transport_penalty = 0.25 * cp.quad_over_lin(v[sample_idx, :], lambda_var)
+        objective_terms.append(sample_vector @ v[sample_idx, :] - transport_penalty + entropy_term)
+
+    objective = (1.0 / n_samples) * cp.sum(cp.hstack(objective_terms)) - lambda_var * float(epsilon) ** 2
+    constraints = [
+        cp.sum(w) == 1.0,
+        w >= weight_floor,
+        w <= upper_bound,
+        lambda_var >= float(lambda_floor),
+    ]
+
+    problem = cp.Problem(cp.Maximize(objective), constraints)
+    problem.solve(solver=solver, warm_start=True)
+
+    if w.value is None:
+        fallback = solve_log_return_growth_proxy(
+            log_returns=log_returns,
+            epsilon=epsilon,
+            bounds=bounds,
+            solver=solver,
+        )
+        fallback.update(
+            {
+                "status": f"fallback::{problem.status}",
+                "lambda_value": np.nan,
+                "effective_n": float(1.0 / np.square(fallback["weights"]).sum()),
+                "sample_average_log_wealth": np.nan,
+                "model_form": "wasserstein_kelly_exact_p2_fallback",
+            }
+        )
+        return fallback
+
+    weights = pd.Series(np.asarray(w.value).ravel(), index=assets, name="weight")
+    weights = weights.clip(lower=0.0)
+    weights = weights / weights.sum()
+
+    gross_asset_returns = np.exp(samples)
+    portfolio_growth = gross_asset_returns @ weights.to_numpy(dtype=float)
+    sample_log_wealth = np.log(np.clip(portfolio_growth, 1e-12, None))
+
+    return {
+        "weights": weights,
+        "status": problem.status,
+        "objective_value": float(problem.value) if problem.value is not None else np.nan,
+        "chosen_epsilon": float(epsilon),
+        "lambda_value": float(lambda_var.value) if lambda_var.value is not None else np.nan,
+        "sample_average_log_wealth": float(sample_log_wealth.mean()),
+        "worst_case_log_wealth_proxy": float(problem.value) if problem.value is not None else np.nan,
+        "expected_log_return": float(log_returns.mean().fillna(0.0) @ weights),
+        "effective_n": float(1.0 / np.square(weights).sum()),
+        "model_form": "wasserstein_kelly_exact_p2",
     }
 
 

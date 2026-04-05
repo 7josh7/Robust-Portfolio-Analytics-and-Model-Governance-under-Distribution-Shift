@@ -17,12 +17,18 @@ full_rebalance_band_l1: 0.20
 covariance_method: "ledoit_wolf"
 regime_lookback: 252
 regime_states: 2
+regime_engine: "hmm"
 regime_covariance_method: "state_aware"
 regime_calm_covariance_method: "ledoit_wolf"
 regime_stressed_covariance_method: "ewma"
 regime_probability_temperature: 3.0
 regime_probability_threshold: 0.70
+regime_current_probability_mode: "filtered"
+regime_estimation_probability_mode: "smoothed"
+regime_switching_variance: true
 monitoring_lookback: 63
+scenario_parallel_jobs: -1
+scenario_parallel_backend: "loky"
 regime_model_type: "random_forest"
 regime_test_fraction: 0.30
 regime_label_quantile: 0.67
@@ -37,6 +43,8 @@ selection_fallback_penalty_weight: 10.0
 selection_sensitivity_penalty_weight: 1.0
 selection_corruption_penalty_weight: 1.25
 selection_stress_penalty_weight: 3.0
+selection_concentration_penalty_weight: 0.25
+selection_drawdown_penalty_weight: 1.0
 selection_mean_perturbation_scale: 0.25
 selection_covariance_perturbation_scale: 0.20
 selection_corruption_noise_scale: 0.15
@@ -51,11 +59,18 @@ drmv_target_method: "benchmark_fraction"
 drmv_target_scale: 0.50
 drmv_alpha_bar_rule: "delta_adjusted"
 drmv_p_norm: 2
+drmv_calibration_mode: "practical"
+drmv_objective_mode: "production"
 drmv_alpha_bar_scale_grid:
   - 0.25
   - 0.5
   - 0.75
   - 1.0
+drmv_paper_reference_alpha_bar_scale_grid:
+  - 0.5
+  - 1.0
+  - 1.5
+  - 2.0
 drmv_delta_grid:
   - 0.00001
   - 0.0001

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, is_dataclass
 from typing import Callable
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 
 from .features import herfindahl_index, max_drawdown, top_k_weight_share
 
@@ -18,6 +20,14 @@ def _config_to_dict(config: dict | object) -> dict:
     if isinstance(config, dict):
         return dict(config)
     raise TypeError("Config must be a dict or dataclass instance.")
+
+
+def _resolve_parallel_jobs(requested_n_jobs: int | None, task_count: int) -> int:
+    if task_count <= 1 or requested_n_jobs is None:
+        return 1
+    if int(requested_n_jobs) == -1:
+        return min(os.cpu_count() or 1, task_count)
+    return min(max(int(requested_n_jobs), 1), task_count)
 
 
 def compute_turnover(new_weights: pd.Series, old_weights: pd.Series | None) -> float:
@@ -136,6 +146,7 @@ def run_rolling_backtest(
         train_slice = returns.iloc[rebalance_idx - val_window - train_window : rebalance_idx - val_window]
         val_slice = returns.iloc[rebalance_idx - val_window : rebalance_idx]
         hold_slice = returns.iloc[rebalance_idx : min(rebalance_idx + rebalance_freq, len(returns))]
+        hold_slice_filled = hold_slice.fillna(0.0)
         strategy_config = dict(cfg)
         strategy_config["rebalance_date"] = rebalance_date
 
@@ -153,7 +164,7 @@ def run_rolling_backtest(
             turnover = float(execution["executed_turnover"])
             transaction_cost = turnover * transaction_cost_bps / 10_000.0
 
-            gross_realized_returns = (hold_slice.fillna(0.0) @ weights).rename(name)
+            gross_realized_returns = (hold_slice_filled @ weights).rename(name)
             realized_returns = gross_realized_returns.copy()
             if not gross_realized_returns.empty:
                 realized_returns.iloc[0] -= transaction_cost
@@ -184,8 +195,14 @@ def run_rolling_backtest(
                     "target_source": result.get("target_source", ""),
                     "target_rule": result.get("target_rule", ""),
                     "covariance_method": result.get("covariance_method", ""),
+                    "paper_mode": result.get("paper_mode", ""),
+                    "calibration_mode": result.get("calibration_mode", ""),
+                    "objective_mode": result.get("objective_mode", ""),
                     "regime_conditioned": result.get("regime_conditioned", False),
                     "stressed_probability": result.get("stressed_probability", np.nan),
+                    "regime_model_version": result.get("regime_model_version", ""),
+                    "regime_model_status": result.get("regime_model_status", ""),
+                    "probability_mode": result.get("probability_mode", ""),
                     "slack_used": result.get("slack_used", np.nan),
                     "binding_margin": result.get("binding_margin", np.nan),
                     "robust_penalty": result.get("robust_penalty", np.nan),
@@ -448,56 +465,111 @@ def build_rolling_rebalance_diagnostics(
     return diagnostics
 
 
+def _run_single_sensitivity_rebalance(
+    rebalance_date: pd.Timestamp,
+    simple_returns: pd.DataFrame,
+    strategies: dict[str, StrategyFunction],
+    cfg: dict,
+    perturbations: dict[str, Callable[[pd.DataFrame], pd.DataFrame]],
+) -> list[dict]:
+    rows: list[dict] = []
+    rebalance_loc = simple_returns.index.get_indexer([pd.Timestamp(rebalance_date)], method="nearest")[0]
+    train_end = rebalance_loc - cfg["val_window"]
+    train_start = train_end - cfg["train_window"]
+    if train_start < 0:
+        return rows
+
+    train_sample = simple_returns.iloc[train_start:train_end]
+    val_sample = simple_returns.iloc[train_end:rebalance_loc]
+    strategy_config = dict(cfg)
+    strategy_config["rebalance_date"] = pd.Timestamp(rebalance_date)
+    strategy_config["previous_epsilon"] = None
+
+    base_results = {
+        name: strategy(train_sample, val_sample, None, strategy_config)
+        for name, strategy in strategies.items()
+    }
+
+    for perturbation_name, perturbation in perturbations.items():
+        perturbed_train = perturbation(train_sample)
+        perturbed_results = {
+            name: strategy(perturbed_train, val_sample, None, strategy_config)
+            for name, strategy in strategies.items()
+        }
+        for strategy_name, base_result in base_results.items():
+            base_weights = base_result["weights"]
+            perturbed_weights = perturbed_results[strategy_name]["weights"].reindex(base_weights.index).fillna(0.0)
+            rows.append(
+                {
+                    "rebalance_date": pd.Timestamp(rebalance_date),
+                    "strategy": strategy_name,
+                    "perturbation": perturbation_name,
+                    "weight_l1_change": float((base_weights - perturbed_weights).abs().sum()),
+                    "concentration_change": herfindahl_index(perturbed_weights) - herfindahl_index(base_weights),
+                    "top_3_share_change": top_k_weight_share(perturbed_weights, k=3) - top_k_weight_share(base_weights, k=3),
+                    "forecast_vol_change": perturbed_results[strategy_name]["forecast_vol"] - base_result["forecast_vol"],
+                }
+            )
+    return rows
+
+
 def run_sensitivity_scenarios(
     simple_returns: pd.DataFrame,
     strategies: dict[str, StrategyFunction],
     config: dict | object,
     rebalance_dates: list[pd.Timestamp],
     perturbations: dict[str, Callable[[pd.DataFrame], pd.DataFrame]],
+    n_jobs: int | None = None,
 ) -> pd.DataFrame:
     cfg = _config_to_dict(config)
-    rows: list[dict] = []
-
-    for rebalance_date in rebalance_dates:
-        rebalance_loc = simple_returns.index.get_indexer([pd.Timestamp(rebalance_date)], method="nearest")[0]
-        train_end = rebalance_loc - cfg["val_window"]
-        train_start = train_end - cfg["train_window"]
-        if train_start < 0:
-            continue
-
-        train_sample = simple_returns.iloc[train_start:train_end].copy()
-        val_sample = simple_returns.iloc[train_end:rebalance_loc].copy()
-        strategy_config = dict(cfg)
-        strategy_config["rebalance_date"] = pd.Timestamp(rebalance_date)
-        strategy_config["previous_epsilon"] = None
-
-        base_results = {
-            name: strategy(train_sample, val_sample, None, strategy_config)
-            for name, strategy in strategies.items()
-        }
-
-        for perturbation_name, perturbation in perturbations.items():
-            perturbed_train = perturbation(train_sample.copy())
-            perturbed_results = {
-                name: strategy(perturbed_train, val_sample, None, strategy_config)
-                for name, strategy in strategies.items()
-            }
-            for strategy_name, base_result in base_results.items():
-                base_weights = base_result["weights"]
-                perturbed_weights = perturbed_results[strategy_name]["weights"].reindex(base_weights.index).fillna(0.0)
-                rows.append(
-                    {
-                        "rebalance_date": pd.Timestamp(rebalance_date),
-                        "strategy": strategy_name,
-                        "perturbation": perturbation_name,
-                        "weight_l1_change": float((base_weights - perturbed_weights).abs().sum()),
-                        "concentration_change": herfindahl_index(perturbed_weights) - herfindahl_index(base_weights),
-                        "top_3_share_change": top_k_weight_share(perturbed_weights, k=3) - top_k_weight_share(base_weights, k=3),
-                        "forecast_vol_change": perturbed_results[strategy_name]["forecast_vol"] - base_result["forecast_vol"],
-                    }
-                )
-
+    requested_jobs = cfg.get("scenario_parallel_jobs", 1) if n_jobs is None else n_jobs
+    parallel_jobs = _resolve_parallel_jobs(requested_jobs, len(rebalance_dates))
+    if parallel_jobs == 1:
+        rows = [
+            row
+            for rebalance_date in rebalance_dates
+            for row in _run_single_sensitivity_rebalance(
+                rebalance_date=rebalance_date,
+                simple_returns=simple_returns,
+                strategies=strategies,
+                cfg=cfg,
+                perturbations=perturbations,
+            )
+        ]
+    else:
+        task_rows = Parallel(
+            n_jobs=parallel_jobs,
+            backend=cfg.get("scenario_parallel_backend", "loky"),
+            max_nbytes=None,
+        )(
+            delayed(_run_single_sensitivity_rebalance)(
+                rebalance_date=rebalance_date,
+                simple_returns=simple_returns,
+                strategies=strategies,
+                cfg=cfg,
+                perturbations=perturbations,
+            )
+            for rebalance_date in rebalance_dates
+        )
+        rows = [row for batch in task_rows for row in batch]
     return pd.DataFrame(rows)
+
+
+def _run_single_corruption_scenario(
+    scenario_name: str,
+    scenario_returns: pd.DataFrame,
+    strategies: dict[str, StrategyFunction],
+    cfg: dict,
+) -> pd.DataFrame:
+    artifacts = run_rolling_backtest(simple_returns=scenario_returns, strategies=strategies, config=cfg)
+    summary = summarize_backtest(
+        daily_returns=artifacts["daily_returns"],
+        gross_daily_returns=artifacts["gross_daily_returns"],
+        weights_history=artifacts["weights_history"],
+        rebalance_results=artifacts["rebalance_results"],
+    ).reset_index()
+    summary["corruption"] = scenario_name
+    return summary
 
 
 def run_corruption_stress(
@@ -505,20 +577,84 @@ def run_corruption_stress(
     strategies: dict[str, StrategyFunction],
     corruption_scenarios: dict[str, pd.DataFrame],
     config: dict | object,
+    n_jobs: int | None = None,
 ) -> pd.DataFrame:
     cfg = _config_to_dict(config)
-    rows: list[pd.DataFrame] = []
-    for scenario_name, scenario_returns in corruption_scenarios.items():
-        artifacts = run_rolling_backtest(simple_returns=scenario_returns, strategies=strategies, config=cfg)
-        summary = summarize_backtest(
-            daily_returns=artifacts["daily_returns"],
-            gross_daily_returns=artifacts["gross_daily_returns"],
-            weights_history=artifacts["weights_history"],
-            rebalance_results=artifacts["rebalance_results"],
-        ).reset_index()
-        summary["corruption"] = scenario_name
-        rows.append(summary)
+    scenario_items = list(corruption_scenarios.items())
+    requested_jobs = cfg.get("scenario_parallel_jobs", 1) if n_jobs is None else n_jobs
+    parallel_jobs = _resolve_parallel_jobs(requested_jobs, len(scenario_items))
+    if parallel_jobs == 1:
+        rows = [
+            _run_single_corruption_scenario(
+                scenario_name=scenario_name,
+                scenario_returns=scenario_returns,
+                strategies=strategies,
+                cfg=cfg,
+            )
+            for scenario_name, scenario_returns in scenario_items
+        ]
+    else:
+        rows = Parallel(
+            n_jobs=parallel_jobs,
+            backend=cfg.get("scenario_parallel_backend", "loky"),
+            max_nbytes=None,
+        )(
+            delayed(_run_single_corruption_scenario)(
+                scenario_name=scenario_name,
+                scenario_returns=scenario_returns,
+                strategies=strategies,
+                cfg=cfg,
+            )
+            for scenario_name, scenario_returns in scenario_items
+        )
     return pd.concat(rows, ignore_index=True)
+
+
+def summarize_sensitivity_results(sensitivity_results: pd.DataFrame) -> pd.DataFrame:
+    if sensitivity_results.empty:
+        return pd.DataFrame()
+    return (
+        sensitivity_results.groupby(["strategy", "perturbation"], observed=True)
+        .agg(
+            avg_weight_l1_change=("weight_l1_change", "mean"),
+            max_weight_l1_change=("weight_l1_change", "max"),
+            avg_concentration_change=("concentration_change", "mean"),
+            avg_top_3_share_change=("top_3_share_change", "mean"),
+            avg_forecast_vol_change=("forecast_vol_change", "mean"),
+        )
+        .reset_index()
+        .sort_values(["perturbation", "avg_weight_l1_change", "strategy"], ascending=[True, False, True])
+    )
+
+
+def summarize_corruption_degradation(
+    corruption_summary: pd.DataFrame,
+    clean_label: str = "clean",
+) -> pd.DataFrame:
+    if corruption_summary.empty:
+        return pd.DataFrame()
+    if clean_label not in set(corruption_summary["corruption"]):
+        return corruption_summary.copy()
+
+    clean_reference = corruption_summary[corruption_summary["corruption"] == clean_label].set_index("strategy")
+    enriched = corruption_summary.copy()
+    enriched["sharpe_drop_vs_clean"] = enriched.apply(
+        lambda row: clean_reference.loc[row["strategy"], "sharpe_ratio"] - row["sharpe_ratio"],
+        axis=1,
+    )
+    enriched["turnover_increase_vs_clean"] = enriched.apply(
+        lambda row: row["average_turnover"] - clean_reference.loc[row["strategy"], "average_turnover"],
+        axis=1,
+    )
+    enriched["risk_gap_increase_vs_clean"] = enriched.apply(
+        lambda row: row["forecast_realized_risk_gap"] - clean_reference.loc[row["strategy"], "forecast_realized_risk_gap"],
+        axis=1,
+    )
+    enriched["gross_to_net_drag_change"] = enriched.apply(
+        lambda row: row["annualized_return_cost_drag"] - clean_reference.loc[row["strategy"], "annualized_return_cost_drag"],
+        axis=1,
+    )
+    return enriched
 
 
 def summarize_by_group(

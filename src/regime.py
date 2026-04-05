@@ -34,7 +34,53 @@ def _weighted_covariance(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
     return covariance
 
 
-def estimate_regime_probabilities(
+def _resolve_stressed_state(
+    probability_frame: pd.DataFrame,
+    factor_returns: pd.Series,
+    probability_columns: list[str],
+) -> tuple[int, int]:
+    state_rows: list[tuple[int, float, float]] = []
+    aligned_factor = factor_returns.reindex(probability_frame.index).fillna(0.0)
+    factor_values = aligned_factor.to_numpy(dtype=float)
+    for probability_column in probability_columns:
+        state_index = int(probability_column.split("_")[1])
+        weights = probability_frame[probability_column].to_numpy(dtype=float)
+        weight_sum = max(weights.sum(), 1e-12)
+        mean = float(np.sum(weights * factor_values) / weight_sum)
+        variance = float(np.sum(weights * np.square(factor_values - mean)) / weight_sum)
+        state_rows.append((state_index, mean, variance))
+
+    stressed_state = min(state_rows, key=lambda item: (item[1], -item[2]))[0]
+    calm_state = max(state_rows, key=lambda item: (item[1], -item[2]))[0]
+    return stressed_state, calm_state
+
+
+def _format_regime_probability_frame(
+    probabilities: np.ndarray | pd.DataFrame,
+    index: pd.Index,
+    factor_returns: pd.Series,
+) -> pd.DataFrame:
+    if isinstance(probabilities, pd.DataFrame):
+        probability_frame = probabilities.copy()
+        probability_frame.index = index
+    else:
+        probability_frame = pd.DataFrame(
+            np.asarray(probabilities, dtype=float),
+            index=index,
+            columns=[f"regime_{idx}_prob" for idx in range(np.asarray(probabilities).shape[1])],
+        )
+
+    probability_columns = [column for column in probability_frame.columns if str(column).endswith("_prob")]
+    stressed_state, calm_state = _resolve_stressed_state(probability_frame, factor_returns, probability_columns)
+    probability_frame["most_likely_regime"] = probability_frame[probability_columns].to_numpy().argmax(axis=1)
+    probability_frame["stressed_state"] = stressed_state
+    probability_frame["calm_state"] = calm_state
+    probability_frame["stressed_probability"] = probability_frame[f"regime_{stressed_state}_prob"]
+    probability_frame["calm_probability"] = probability_frame[f"regime_{calm_state}_prob"]
+    return probability_frame
+
+
+def estimate_mixture_regime_probabilities(
     market_factor_series: pd.Series,
     n_regimes: int = 2,
     lookback: int | None = None,
@@ -66,32 +112,194 @@ def estimate_regime_probabilities(
     )
     if len(feature_frame) < max(10, n_regimes):
         probabilities = np.full((len(feature_frame), n_regimes), 1.0 / n_regimes)
-        state_means = np.repeat(float(feature_frame["market_factor"].mean()), n_regimes)
     else:
         model = GaussianMixture(n_components=n_regimes, covariance_type="full", random_state=random_state)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="KMeans is known to have a memory leak on Windows with MKL")
             model.fit(feature_frame.to_numpy())
         probabilities = model.predict_proba(feature_frame.to_numpy())
-        state_means = model.means_[:, 0]
 
-    state_order = np.argsort(state_means)
-    stressed_state = int(state_order[0])
-    calm_state = int(state_order[-1])
-
-    regime_probs = pd.DataFrame(
-        probabilities,
+    regime_probs = _format_regime_probability_frame(
+        probabilities=probabilities,
         index=feature_frame.index,
-        columns=[f"regime_{idx}_prob" for idx in range(n_regimes)],
+        factor_returns=feature_frame["market_factor"],
     )
-    regime_probs["most_likely_regime"] = probabilities.argmax(axis=1)
-    regime_probs["stressed_probability"] = regime_probs[f"regime_{stressed_state}_prob"]
-    regime_probs["stressed_state"] = stressed_state
-    regime_probs["calm_state"] = calm_state
+    regime_probs["regime_model_version"] = "mixture"
     return regime_probs
 
 
-def estimate_regime_conditioned_inputs(
+def estimate_regime_probabilities(
+    market_factor_series: pd.Series,
+    n_regimes: int = 2,
+    lookback: int | None = None,
+    random_state: int = 7,
+) -> pd.DataFrame:
+    """
+    Backward-compatible alias for the lightweight regime-mixture estimator.
+
+    The HMM workflow now lives in ``fit_two_state_hmm`` and
+    ``estimate_regime_conditioned_inputs_hmm``.
+    """
+
+    return estimate_mixture_regime_probabilities(
+        market_factor_series=market_factor_series,
+        n_regimes=n_regimes,
+        lookback=lookback,
+        random_state=random_state,
+    )
+
+
+def fit_two_state_hmm(
+    market_factor_series: pd.Series,
+    lookback: int | None = None,
+    switching_variance: bool = True,
+) -> dict[str, object]:
+    """
+    Fit a two-state hidden Markov / Markov-switching model on a market factor.
+
+    This uses ``statsmodels`` Markov regression as a tractable two-regime proxy
+    for a Costa-Kwon-style latent market-state engine.
+    """
+
+    from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+
+    factor = market_factor_series.dropna()
+    if lookback is not None:
+        factor = factor.tail(lookback)
+    if len(factor) < 30:
+        raise ValueError("At least 30 observations are required to fit the two-state HMM.")
+
+    model = MarkovRegression(
+        factor.astype(float),
+        k_regimes=2,
+        trend="c",
+        switching_variance=bool(switching_variance),
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*Maximum Likelihood optimization failed to converge.*")
+        warnings.filterwarnings("ignore", message=".*divide by zero encountered.*")
+        result = model.fit(disp=False)
+
+    return {
+        "model": model,
+        "result": result,
+        "series": factor,
+        "lookback": len(factor),
+        "regime_model_version": "hmm_markov_regression",
+    }
+
+
+def infer_filtered_regime_probs(
+    hmm_fit: dict[str, object],
+) -> pd.DataFrame:
+    result = hmm_fit["result"]
+    factor = hmm_fit["series"]
+    probabilities = pd.DataFrame(result.filtered_marginal_probabilities, index=factor.index)
+    probabilities.columns = [f"regime_{idx}_prob" for idx in range(probabilities.shape[1])]
+    formatted = _format_regime_probability_frame(probabilities, factor.index, factor)
+    formatted["probability_mode"] = "filtered"
+    formatted["regime_model_version"] = hmm_fit.get("regime_model_version", "hmm_markov_regression")
+    return formatted
+
+
+def infer_smoothed_regime_probs(
+    hmm_fit: dict[str, object],
+) -> pd.DataFrame:
+    result = hmm_fit["result"]
+    factor = hmm_fit["series"]
+    probabilities = pd.DataFrame(result.smoothed_marginal_probabilities, index=factor.index)
+    probabilities.columns = [f"regime_{idx}_prob" for idx in range(probabilities.shape[1])]
+    formatted = _format_regime_probability_frame(probabilities, factor.index, factor)
+    formatted["probability_mode"] = "smoothed"
+    formatted["regime_model_version"] = hmm_fit.get("regime_model_version", "hmm_markov_regression")
+    return formatted
+
+
+def estimate_regime_conditioned_mean(
+    asset_returns: pd.DataFrame,
+    regime_probs: pd.DataFrame,
+) -> dict[str, pd.Series]:
+    aligned_probs = regime_probs.reindex(asset_returns.index).dropna()
+    aligned_returns = asset_returns.reindex(aligned_probs.index).fillna(0.0)
+    values = aligned_returns.to_numpy(dtype=float)
+    state_means: dict[str, pd.Series] = {}
+
+    for probability_column in [column for column in aligned_probs.columns if str(column).endswith("_prob")]:
+        state_weights = aligned_probs[probability_column].to_numpy(dtype=float)
+        if state_weights.sum() <= 1e-12:
+            state_means[probability_column] = aligned_returns.mean().rename(probability_column)
+            continue
+        state_means[probability_column] = pd.Series(
+            _weighted_mean(values, state_weights),
+            index=aligned_returns.columns,
+            name=probability_column,
+        )
+    return state_means
+
+
+def estimate_regime_conditioned_covariance(
+    asset_returns: pd.DataFrame,
+    regime_probs: pd.DataFrame,
+    covariance_method: str = "ledoit_wolf",
+    calm_covariance_method: str | None = None,
+    stressed_covariance_method: str | None = None,
+) -> dict[str, np.ndarray]:
+    aligned_probs = regime_probs.reindex(asset_returns.index).dropna()
+    aligned_returns = asset_returns.reindex(aligned_probs.index).fillna(0.0)
+    state_covariances: dict[str, np.ndarray] = {}
+    state_columns = [column for column in aligned_probs.columns if str(column).endswith("_prob")]
+    stressed_state = int(aligned_probs["stressed_state"].iloc[-1]) if "stressed_state" in aligned_probs else 0
+    values = aligned_returns.to_numpy(dtype=float)
+
+    for probability_column in state_columns:
+        state_weights = aligned_probs[probability_column].to_numpy(dtype=float)
+        state_cov = _weighted_covariance(values, state_weights) if state_weights.sum() > 1e-12 else np.nan
+        state_index = int(probability_column.split("_")[1])
+        if covariance_method == "state_aware":
+            selected_covariance_method = (
+                stressed_covariance_method if state_index == stressed_state else calm_covariance_method
+            ) or "ledoit_wolf"
+        else:
+            selected_covariance_method = covariance_method
+        weighted_sample_covariance = (
+            estimate_covariance_matrix(aligned_returns, method="sample")
+            if isinstance(state_cov, float) or np.isnan(state_cov).any()
+            else ensure_psd(state_cov)
+        )
+        if selected_covariance_method == "sample":
+            state_covariances[probability_column] = weighted_sample_covariance
+            continue
+
+        subset_cutoff = float(np.quantile(state_weights, 0.60)) if len(state_weights) > 5 else 0.0
+        state_subset = aligned_returns.loc[state_weights >= subset_cutoff]
+        if len(state_subset) < max(20, aligned_returns.shape[1] * 3):
+            state_subset = aligned_returns
+        method_covariance = estimate_covariance_matrix(state_subset, method=selected_covariance_method)
+        state_covariances[probability_column] = ensure_psd(0.50 * weighted_sample_covariance + 0.50 * method_covariance)
+    return state_covariances
+
+
+def _combine_regime_state_inputs(
+    aligned_returns: pd.DataFrame,
+    state_means: dict[str, pd.Series],
+    state_covariances: dict[str, np.ndarray],
+    latest_probabilities: pd.Series,
+) -> tuple[pd.Series, np.ndarray]:
+    probability_columns = [column for column in latest_probabilities.index if str(column).endswith("_prob")]
+    mixture_mean = sum(float(latest_probabilities[column]) * state_means[column] for column in probability_columns)
+    mixture_covariance = np.zeros((aligned_returns.shape[1], aligned_returns.shape[1]), dtype=float)
+    mean_vector = mixture_mean.reindex(aligned_returns.columns).to_numpy(dtype=float)
+
+    for column in probability_columns:
+        state_mean_vector = state_means[column].reindex(aligned_returns.columns).to_numpy(dtype=float)
+        state_covariance = state_covariances[column]
+        mean_gap = state_mean_vector - mean_vector
+        mixture_covariance += float(latest_probabilities[column]) * (state_covariance + np.outer(mean_gap, mean_gap))
+
+    return mixture_mean.rename("regime_conditioned_mean"), ensure_psd(mixture_covariance)
+
+
+def estimate_regime_conditioned_inputs_mixture(
     asset_returns: pd.DataFrame,
     factor_returns: pd.Series | None = None,
     regime_probs: pd.DataFrame | None = None,
@@ -120,7 +328,11 @@ def estimate_regime_conditioned_inputs(
         factor_returns = factor_returns.reindex(recent_returns.index).fillna(0.0)
 
     if regime_probs is None:
-        regime_probs = estimate_regime_probabilities(factor_returns, n_regimes=2, lookback=len(recent_returns))
+        regime_probs = estimate_mixture_regime_probabilities(
+            factor_returns,
+            n_regimes=2,
+            lookback=len(recent_returns),
+        )
 
     aligned_probs = regime_probs.reindex(recent_returns.index).dropna()
     aligned_returns = recent_returns.reindex(aligned_probs.index).fillna(0.0)
@@ -128,46 +340,28 @@ def estimate_regime_conditioned_inputs(
     if not probability_columns:
         raise ValueError("Regime probability frame does not contain probability columns.")
 
-    stressed_state = int(aligned_probs["stressed_state"].iloc[-1]) if "stressed_state" in aligned_probs else 0
-    state_means: dict[str, pd.Series] = {}
-    state_covariances: dict[str, np.ndarray] = {}
-    values = aligned_returns.to_numpy()
-
-    for probability_column in probability_columns:
-        state_weights = aligned_probs[probability_column].to_numpy(dtype=float)
-        if state_weights.sum() <= 1e-12:
-            state_means[probability_column] = aligned_returns.mean().rename(probability_column)
-            state_covariances[probability_column] = estimate_covariance_matrix(aligned_returns, method=covariance_method)
-            continue
-        state_mean = pd.Series(_weighted_mean(values, state_weights), index=aligned_returns.columns, name=probability_column)
-        state_cov = _weighted_covariance(values, state_weights)
-        state_means[probability_column] = state_mean
-        state_index = int(probability_column.split("_")[1])
-        if covariance_method == "state_aware":
-            selected_covariance_method = (
-                stressed_covariance_method if state_index == stressed_state else calm_covariance_method
-            ) or "ledoit_wolf"
-        else:
-            selected_covariance_method = covariance_method
-        state_covariances[probability_column] = (
-            estimate_covariance_matrix(aligned_returns, method=selected_covariance_method)
-            if np.isnan(state_cov).any() or selected_covariance_method != "sample"
-            else ensure_psd(state_cov)
-        )
+    state_means = estimate_regime_conditioned_mean(aligned_returns, aligned_probs)
+    state_covariances = estimate_regime_conditioned_covariance(
+        aligned_returns,
+        aligned_probs,
+        covariance_method=covariance_method,
+        calm_covariance_method=calm_covariance_method,
+        stressed_covariance_method=stressed_covariance_method,
+    )
 
     latest_probabilities = aligned_probs[probability_columns].iloc[-1]
     if probability_temperature != 1.0:
         sharpened = np.power(np.clip(latest_probabilities.to_numpy(dtype=float), 1e-12, 1.0), float(probability_temperature))
         latest_probabilities = pd.Series(sharpened / sharpened.sum(), index=latest_probabilities.index)
-    mixture_mean = sum(float(latest_probabilities[column]) * state_means[column] for column in probability_columns)
-    mixture_covariance = np.zeros((aligned_returns.shape[1], aligned_returns.shape[1]), dtype=float)
-    for column in probability_columns:
-        state_mean_vector = state_means[column].reindex(aligned_returns.columns).to_numpy()
-        state_covariance = state_covariances[column]
-        mean_gap = state_mean_vector - mixture_mean.reindex(aligned_returns.columns).to_numpy()
-        mixture_covariance += float(latest_probabilities[column]) * (state_covariance + np.outer(mean_gap, mean_gap))
+    mixture_mean, mixture_covariance = _combine_regime_state_inputs(
+        aligned_returns=aligned_returns,
+        state_means=state_means,
+        state_covariances=state_covariances,
+        latest_probabilities=latest_probabilities,
+    )
 
     latest_regime = int(aligned_probs["most_likely_regime"].iloc[-1])
+    stressed_state = int(aligned_probs["stressed_state"].iloc[-1]) if "stressed_state" in aligned_probs else 0
     stressed_probability = float(aligned_probs[f"regime_{stressed_state}_prob"].iloc[-1])
     stress_activation = float(
         np.clip((stressed_probability - stressed_probability_threshold) / max(1.0 - stressed_probability_threshold, 1e-12), 0.0, 1.0)
@@ -175,14 +369,152 @@ def estimate_regime_conditioned_inputs(
 
     return {
         "mean_returns": mixture_mean.rename("regime_conditioned_mean"),
-        "covariance": ensure_psd(mixture_covariance),
+        "covariance": mixture_covariance,
         "latest_regime": latest_regime,
         "stressed_probability": stressed_probability,
         "stress_activation": stress_activation,
         "regime_probabilities": aligned_probs,
         "state_means": state_means,
         "state_covariances": state_covariances,
+        "regime_model_version": "mixture",
+        "probability_mode": "mixture",
     }
+
+
+def estimate_regime_conditioned_inputs_hmm(
+    asset_returns: pd.DataFrame,
+    factor_returns: pd.Series | None = None,
+    lookback: int = 252,
+    covariance_method: str = "ledoit_wolf",
+    calm_covariance_method: str | None = None,
+    stressed_covariance_method: str | None = None,
+    probability_temperature: float = 1.0,
+    stressed_probability_threshold: float = 0.0,
+    switching_variance: bool = True,
+    current_probability_mode: str = "filtered",
+    estimation_probability_mode: str = "smoothed",
+) -> dict[str, object]:
+    """
+    Estimate regime-conditioned inputs from a two-state HMM/Markov-switching fit.
+
+    The state probabilities are inferred from a market factor, state-specific
+    moments are estimated on the recent history, and the latest regime
+    probabilities are used to mix those state inputs into current portfolio
+    parameters.
+    """
+
+    recent_returns = asset_returns.tail(lookback).fillna(0.0)
+    if recent_returns.empty:
+        raise ValueError("Asset returns are empty after lookback filtering.")
+
+    if factor_returns is None:
+        factor_returns = recent_returns.mean(axis=1).rename("market_factor")
+    else:
+        factor_returns = factor_returns.reindex(recent_returns.index).fillna(0.0)
+
+    try:
+        hmm_fit = fit_two_state_hmm(
+            market_factor_series=factor_returns,
+            lookback=len(recent_returns),
+            switching_variance=switching_variance,
+        )
+        filtered_probs = infer_filtered_regime_probs(hmm_fit)
+        smoothed_probs = infer_smoothed_regime_probs(hmm_fit)
+    except Exception as exc:
+        mixture_result = estimate_regime_conditioned_inputs_mixture(
+            asset_returns=asset_returns,
+            factor_returns=factor_returns,
+            lookback=lookback,
+            covariance_method=covariance_method,
+            calm_covariance_method=calm_covariance_method,
+            stressed_covariance_method=stressed_covariance_method,
+            probability_temperature=probability_temperature,
+            stressed_probability_threshold=stressed_probability_threshold,
+        )
+        mixture_result["regime_model_version"] = "hmm_fallback_to_mixture"
+        mixture_result["regime_model_status"] = f"fallback::{type(exc).__name__}"
+        return mixture_result
+
+    current_mode = current_probability_mode.lower()
+    estimation_mode = estimation_probability_mode.lower()
+    estimation_probs = smoothed_probs if estimation_mode == "smoothed" else filtered_probs
+    current_probs = filtered_probs if current_mode == "filtered" else smoothed_probs
+
+    aligned_estimation_probs = estimation_probs.reindex(recent_returns.index).dropna()
+    aligned_returns = recent_returns.reindex(aligned_estimation_probs.index).fillna(0.0)
+    probability_columns = [column for column in aligned_estimation_probs.columns if column.endswith("_prob")]
+    state_means = estimate_regime_conditioned_mean(aligned_returns, aligned_estimation_probs)
+    state_covariances = estimate_regime_conditioned_covariance(
+        aligned_returns,
+        aligned_estimation_probs,
+        covariance_method=covariance_method,
+        calm_covariance_method=calm_covariance_method,
+        stressed_covariance_method=stressed_covariance_method,
+    )
+
+    latest_probabilities = current_probs.reindex(aligned_returns.index).dropna()[probability_columns].iloc[-1]
+    if probability_temperature != 1.0:
+        sharpened = np.power(np.clip(latest_probabilities.to_numpy(dtype=float), 1e-12, 1.0), float(probability_temperature))
+        latest_probabilities = pd.Series(sharpened / sharpened.sum(), index=latest_probabilities.index)
+
+    mixture_mean, mixture_covariance = _combine_regime_state_inputs(
+        aligned_returns=aligned_returns,
+        state_means=state_means,
+        state_covariances=state_covariances,
+        latest_probabilities=latest_probabilities,
+    )
+
+    latest_probs_frame = current_probs.reindex(aligned_returns.index).dropna()
+    stressed_state = int(latest_probs_frame["stressed_state"].iloc[-1]) if "stressed_state" in latest_probs_frame else 0
+    stressed_probability = float(latest_probs_frame[f"regime_{stressed_state}_prob"].iloc[-1])
+    stress_activation = float(
+        np.clip((stressed_probability - stressed_probability_threshold) / max(1.0 - stressed_probability_threshold, 1e-12), 0.0, 1.0)
+    )
+
+    return {
+        "mean_returns": mixture_mean.rename("regime_conditioned_mean"),
+        "covariance": mixture_covariance,
+        "latest_regime": int(latest_probs_frame["most_likely_regime"].iloc[-1]),
+        "stressed_probability": stressed_probability,
+        "stress_activation": stress_activation,
+        "regime_probabilities": latest_probs_frame,
+        "filtered_regime_probabilities": filtered_probs,
+        "smoothed_regime_probabilities": smoothed_probs,
+        "state_means": state_means,
+        "state_covariances": state_covariances,
+        "regime_model_version": "hmm_markov_regression",
+        "probability_mode": current_mode,
+        "estimation_probability_mode": estimation_mode,
+        "regime_model_status": "trained",
+    }
+
+
+def estimate_regime_conditioned_inputs(
+    asset_returns: pd.DataFrame,
+    factor_returns: pd.Series | None = None,
+    regime_probs: pd.DataFrame | None = None,
+    lookback: int = 252,
+    covariance_method: str = "ledoit_wolf",
+    calm_covariance_method: str | None = None,
+    stressed_covariance_method: str | None = None,
+    probability_temperature: float = 1.0,
+    stressed_probability_threshold: float = 0.0,
+) -> dict[str, object]:
+    """
+    Backward-compatible alias for the original lightweight regime-mixture path.
+    """
+
+    return estimate_regime_conditioned_inputs_mixture(
+        asset_returns=asset_returns,
+        factor_returns=factor_returns,
+        regime_probs=regime_probs,
+        lookback=lookback,
+        covariance_method=covariance_method,
+        calm_covariance_method=calm_covariance_method,
+        stressed_covariance_method=stressed_covariance_method,
+        probability_temperature=probability_temperature,
+        stressed_probability_threshold=stressed_probability_threshold,
+    )
 
 
 def build_regime_labels(

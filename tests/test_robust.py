@@ -121,6 +121,7 @@ def test_drmv_regularized_min_variance_returns_weights_and_margin() -> None:
     assert np.isclose(result["weights"].sum(), 1.0)
     assert "binding_margin" in result
     assert pd.notna(result["chosen_delta"])
+    assert result["paper_mode"] == "practical_tuned_drmv"
 
 
 def test_drmv_selector_returns_parameter_diagnostics() -> None:
@@ -141,3 +142,41 @@ def test_drmv_selector_returns_parameter_diagnostics() -> None:
 
     assert "parameter_diagnostics" in result
     assert {"delta", "alpha_bar", "covariance_method", "validation_score"} <= set(result["parameter_diagnostics"].columns)
+
+
+def test_drmv_selector_supports_paper_reference_mode() -> None:
+    train_returns = _toy_returns().iloc[:-63]
+    val_returns = _toy_returns().iloc[-63:]
+
+    result = selection.tune_drmv_regularized_min_variance(
+        train_returns=train_returns,
+        val_returns=val_returns,
+        delta_grid=[0.0001, 0.001],
+        alpha_bar_scale_grid=[0.5, 1.0],
+        covariance_methods=["sample"],
+        bounds=(0.0, 1.0),
+        target_method="benchmark_fraction",
+        target_scale=0.50,
+        calibration_mode="paper_reference",
+        objective_mode="paper_alignment",
+    )
+
+    assert result["paper_mode"] == "paper_reference_drmv"
+    assert result["calibration_mode"] == "paper_reference"
+    assert result["objective_mode"] == "paper_alignment"
+
+
+def test_wasserstein_kelly_exact_p2_returns_weights_and_effective_n() -> None:
+    train_returns = _toy_returns()
+    log_returns = np.log1p(train_returns)
+
+    result = robust.solve_wasserstein_kelly_exact_p2(
+        log_returns=log_returns.tail(40),
+        epsilon=0.01,
+        bounds=(0.0, 1.0),
+    )
+
+    assert result["weights"].notna().all()
+    assert np.isclose(result["weights"].sum(), 1.0)
+    assert "effective_n" in result
+    assert result["model_form"] in {"wasserstein_kelly_exact_p2", "wasserstein_kelly_exact_p2_fallback"}

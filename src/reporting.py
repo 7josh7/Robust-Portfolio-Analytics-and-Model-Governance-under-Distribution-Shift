@@ -65,6 +65,7 @@ def build_diagnostics_payload(
                             "proposed_turnover",
                             "slack_used",
                             "chosen_epsilon",
+                            "chosen_delta",
                             "epsilon_change",
                             "execution_eta",
                             "realized_vol",
@@ -95,11 +96,17 @@ def save_backtest_figures(
     if focus_strategies is None:
         focus_strategies = [
             strategy
-            for strategy in ["sample_min_var", "sample_mean_variance", "wasserstein_proxy_min_var"]
+            for strategy in [
+                "sample_min_var",
+                "sample_mean_variance",
+                "wasserstein_proxy_min_var",
+                "drmv_regularized_min_var",
+                "drmv_regime_covariance_min_var_hmm",
+            ]
             if strategy in daily_returns.columns
         ]
         if not focus_strategies:
-            focus_strategies = daily_returns.columns.tolist()[:3]
+            focus_strategies = daily_returns.columns.tolist()[:5]
 
     wealth = (1.0 + daily_returns.fillna(0.0)).cumprod()
     fig, ax = plt.subplots(figsize=(12, 6))

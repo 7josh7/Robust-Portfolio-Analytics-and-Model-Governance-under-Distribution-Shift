@@ -1,0 +1,349 @@
+
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools,bm}
+\usepackage{booktabs,longtable,array}
+\usepackage{graphicx,float}
+\usepackage{hyperref,xcolor,setspace,microtype,caption,subcaption,siunitx}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
+\setstretch{1.08}
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{0pt}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ones}{\mathbf{1}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\transpose}{\mathsf{T}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\DRMV}{\ensuremath{\mathrm{DRMV}}}
+\newcommand{\DRO}{\ensuremath{\mathrm{DRO}}}
+\newcommand{\HMM}{\ensuremath{\mathrm{HMM}}}
+\newcommand{\diag}{\ensuremath{\mathrm{diag}}}
+
+\title{\textbf{Robust Portfolio Allocation under Distribution Shift}\\[0.4em]
+\large An Empirical Comparison of Regularized Distributionally Robust Mean--Variance Allocation, Regime-Conditioned Inputs, and Wasserstein-Inspired Baselines}
+\author{}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We implement and compare several tractable portfolio-allocation procedures in a unified rolling out-of-sample study on 12 liquid cross-asset ETFs from 2012 through 2025. The comparison includes equal weight, inverse volatility, sample minimum variance, shrinkage minimum variance, sample mean--variance, a Wasserstein-inspired proxy allocator, a regularized distributionally robust mean--variance (\DRMV) family, and regime-conditioned \DRMV\ extensions motivated by regime-switching models. The strongest specification in the full out-of-sample sample is the practical \DRMV\ implementation, which delivers an annualized return of 7.07\%, annualized volatility of 8.05\%, Sharpe ratio of 0.878, and maximum drawdown of $-19.75\%$. By contrast, sample mean--variance earns the highest raw return, 13.48\%, but with 16.03\% volatility, $-30.02\%$ maximum drawdown, and extreme concentration, with an average top-three weight share of 0.850. Relative to the Wasserstein-inspired proxy, the leading \DRMV\ specification raises Sharpe from 0.839 to 0.878, reduces maximum drawdown by 3.12 percentage points, and lowers average concentration from 0.1818 to 0.1116. A paper-reference \DRMV\ calibration remains essentially tied with the practical mode, while a mixture-based regime-covariance overlay slightly outperforms the more faithful \HMM\ overlay on Sharpe but not on diversification. We interpret these results as evidence that a regularized \DRMV\ implementation offers the strongest empirical balance among risk-adjusted return, drawdown control, and diversification in the present workflow.
+\end{abstract}
+
+\section{Introduction}
+
+Robust portfolio allocation is an empirical problem. The theoretical case for handling estimation error is well established, but that is not the operative question in practice. The operative question is which implementation still performs well after repeated re-estimation, transaction costs, weight constraints, and distribution shift.
+
+We study that question in one rolling backtest. We implement empirical mean--variance and minimum-variance benchmarks, an inverse-volatility baseline, a Wasserstein-inspired proxy allocator, a regularized \DRMV\ family, regime-conditioned extensions of that family, and a log-return-based Wasserstein--Kelly appendix. Our contribution is comparative and empirical: we place these methods under the same data, constraints, and validation protocol, and we ask which implementation delivers the strongest full-sample trade-off among return, volatility, drawdown, concentration, and trading stability.
+
+The main result is sharp. The practical \DRMV\ specification is the best full-sample model on a risk-adjusted basis. It posts a Sharpe ratio of 0.8781, ahead of the mixture regime-covariance \DRMV\ variant at 0.8723, the paper-reference \DRMV\ calibration at 0.8719, and the Wasserstein-inspired proxy at 0.8389. The result is economically meaningful, not just statistically cosmetic. Relative to sample mean--variance, the leading \DRMV\ specification cuts annualized volatility by 7.98 percentage points, reduces maximum drawdown by 10.27 percentage points, and lowers the average top-three weight share by 40.42 percentage points. Relative to the Wasserstein-inspired proxy, it improves both drawdown and diversification.
+
+We do not claim uniform dominance in every subperiod or stress episode. High-beta episodes can reward more aggressive portfolios. Our claim is narrower and more useful: in the full 2016--2025 out-of-sample comparison induced by the rolling protocol, the regularized \DRMV\ implementation delivers the best overall balance of robustness and performance.
+
+\section{Related literature and implementation scope}
+
+The project is motivated by four strands of the literature.
+
+First, Wasserstein \DRO\ provides the broad conceptual framework. Esfahani and Kuhn show that Wasserstein ambiguity sets admit tractable convex reformulations and finite-sample performance guarantees in a broad class of data-driven decision problems \cite{EsfahaniKuhn2018}. That perspective motivates our use of ambiguity radii and worst-case style penalties, even when a given implementation is not a literal transcription of a full dual reformulation.
+
+Second, Blanchet, Chen, and Zhou study Wasserstein-based distributionally robust mean--variance selection and show that the problem admits an empirical optimization form with an explicit regularization term \cite{BlanchetChenZhou2022}. Their formulation is the closest theoretical template for our main \DRMV\ branch. Our implementation remains pragmatic: it uses a square-root risk term and a rolling validation layer, but the regularization logic and robust return floor are directly motivated by that paper.
+
+Third, Costa and Kwon show that regime dependence is most naturally introduced through the input moments supplied to the optimizer rather than by replacing the single-period allocation step itself \cite{CostaKwon2020}. That insight motivates our regime-conditioned \DRMV\ overlays. We implement both a lightweight mixture engine and a two-state \HMM-style market-factor engine.
+
+Fourth, for log-optimal allocation, Li argues that a Wasserstein--Kelly model should be formulated in log-return space rather than directly on simple returns \cite{Li2023}. Hsieh develops a computationally efficient robust log-optimal framework under polyhedral ambiguity sets \cite{Hsieh2023}. We use those papers only in an appendix branch; they do not drive the flagship ranking because their objective differs from the volatility-controlled strategies in the main comparison.
+
+\section{Data and experimental design}
+
+\subsection{Universe, sample period, and rolling windows}
+
+The universe contains 12 liquid cross-asset ETFs,
+\[
+\{\mathrm{SPY},\mathrm{QQQ},\mathrm{IWM},\mathrm{EFA},\mathrm{EEM},\mathrm{TLT},\mathrm{IEF},\mathrm{LQD},\mathrm{HYG},\mathrm{GLD},\mathrm{DBC},\mathrm{VNQ}\},
+\]
+chosen to span domestic equity, international equity, duration, credit, commodities, and real assets. The market-data sample runs from 2012-01-01 through 2025-12-31. We estimate models with a 756-trading-day training window and a 252-trading-day validation window, then rebalance every 21 trading days. Because of the initial estimation burn-in, the realized out-of-sample performance window begins on 2016-01-07 and ends on 2025-12-30.
+
+Let $P_{t,i}$ denote the adjusted close of asset $i$ on date $t$. We define simple returns and log-returns as
+\begin{equation}
+R_{t,i}= \frac{P_{t,i}-P_{t-1,i}}{P_{t-1,i}},
+\qquad
+r_{t,i}= \log\!\left(\frac{P_{t,i}}{P_{t-1,i}}\right).
+\end{equation}
+The vector of simple returns is $R_t\in\R^n$ and the vector of log-returns is $r_t\in\R^n$.
+
+\subsection{Constraints, trading frictions, and execution}
+
+All flagship strategies are long only with a 25\% position cap,
+\begin{equation}
+\ones^\transpose w_t=1,
+\qquad
+0\le w_{t,i}\le 0.25.
+\end{equation}
+We charge proportional transaction costs of 5 basis points per unit turnover. If $w_t$ is the executed portfolio and $w_{t-1}$ is the prior portfolio, the net portfolio return is
+\begin{equation}
+\widetilde R_t^p = w_t^\transpose R_t - c_{\mathrm{tc}}\norm{w_t-w_{t-1}}_1,
+\qquad c_{\mathrm{tc}}=5\times 10^{-4}.
+\end{equation}
+The workflow also applies a no-trade band and partial execution map. Those features matter economically because they suppress small, low-value reallocations that would otherwise vanish after costs.
+
+\subsection{Validation-driven model selection}
+
+At each rebalance date, we select hyperparameters on the validation window. The validation criterion begins with realized Sharpe and subtracts penalties for turnover, forecast--realized risk gaps, drawdown, concentration, constraint pressure, and fallback behavior. For \DRMV\ candidates, we add a perturbation penalty that measures how much the selected weights move under mean and covariance shocks. This matters because the central promise of robust allocation is not raw return alone; it is stable behavior under perturbed inputs.
+
+\section{Implemented allocation models}
+
+\subsection{Benchmarks}
+
+We benchmark the robust families against five standard allocators.
+
+The equal-weight portfolio is
+\begin{equation}
+w^{\mathrm{EW}}= \frac{1}{n}\ones.
+\end{equation}
+
+If $\widehat\Sigma_t$ is an estimated covariance matrix with diagonal entries $\widehat\sigma_{t,i}^2$, the inverse-volatility portfolio is
+\begin{equation}
+w^{\mathrm{IV}}_{t,i}= \frac{\widehat\sigma_{t,i}^{-1}}{\sum_{j=1}^n \widehat\sigma_{t,j}^{-1}}.
+\end{equation}
+
+The sample mean--variance portfolio solves
+\begin{equation}
+\max_w\left\{\widehat\mu_t^\transpose w - \lambda_{\mathrm{mv}}w^\transpose\widehat\Sigma_t w:
+\ones^\transpose w=1,\; 0\le w\le 0.25\right\},
+\end{equation}
+while the minimum-variance benchmarks solve
+\begin{equation}
+\min_w\left\{w^\transpose\widehat\Sigma_t w:
+\ones^\transpose w=1,\; 0\le w\le 0.25\right\},
+\end{equation}
+using either the sample covariance or a shrinkage covariance estimator.
+
+\subsection{Wasserstein-inspired proxy allocator}
+
+The original robust branch is a tractable Wasserstein-inspired proxy. Let $L_t$ satisfy $L_t^\transpose L_t=\widehat\Sigma_t$, let $\varepsilon_t\ge 0$ denote a proxy ambiguity radius, and let $\rho_t$ denote the target return. The implemented problem is
+\begin{align}
+\min_{w,s,r}\quad & \norm{L_t w}_2^2 + \lambda_s s + \lambda_\tau\norm{w-w_{t-1}}_1, \\
+\text{s.t.}\quad & \ones^\transpose w=1, \quad 0\le w\le 0.25, \\
+& \norm{w}_2\le r, \\
+& \widehat\mu_t^\transpose w - \varepsilon_t r + s \ge \rho_t, \\
+& s\ge 0.
+\end{align}
+At zero ambiguity with a hard return constraint, this collapses to the corresponding empirical target-return minimum-variance problem. In the present study, however, we use this model primarily as a robust baseline rather than as the flagship result.
+
+\subsection{Regularized \DRMV\ family}
+
+The main robust branch is a regularized \DRMV\ implementation. Let $\delta_t\ge 0$ be the ambiguity parameter, let $\bar\alpha_t$ be the robust return floor, and let $\norm{w}_p\le r$ define the robust radius proxy. The implemented optimization is
+\begin{align}
+\min_w\quad & \norm{L_t w}_2 + \sqrt{\delta_t}\norm{w}_p + \lambda_\tau\norm{w-w_{t-1}}_1,
+\label{eq:drmv_obj}
+\\
+\text{s.t.}\quad & \ones^\transpose w=1, \quad 0\le w\le 0.25,
+\\
+& \widehat\mu_t^\transpose w \ge \bar\alpha_t + \sqrt{\delta_t}\norm{w}_p.
+\label{eq:drmv_con}
+\end{align}
+The first two terms in \eqref{eq:drmv_obj} are the core of the implementation. The norm term captures volatility through $\widehat\Sigma_t$, and the $\sqrt{\delta_t}\norm{w}_p$ penalty plays the role of the Wasserstein-driven regularizer. The robust return constraint \eqref{eq:drmv_con} forces the portfolio to clear the return hurdle after an ambiguity adjustment.
+
+Two calibration modes matter empirically. In the practical mode, we set
+\begin{equation}
+\bar\alpha_t = \rho_t - c_\alpha\sqrt{\delta_t}.
+\end{equation}
+In the paper-reference mode, we use a closer-to-paper adjustment,
+\begin{equation}
+\bar\alpha_t = \rho_t - c_\alpha\sqrt{\delta_t}\,\norm{\phi_t^{\mathrm{proxy}}}_p,
+\end{equation}
+and we center the candidate $\delta$ grid on the $n^{-1/2}$ scaling intuition discussed by Blanchet, Chen, and Zhou \cite{BlanchetChenZhou2022}.
+
+\subsection{Regime-conditioned \DRMV\ overlays}
+
+We implement two regime-conditioned extensions.
+
+The mixture engine estimates a two-component Gaussian mixture on a market-factor feature vector and uses regime-weighted moments to modify the robust allocation inputs. The \HMM\ engine fits a two-state hidden-state model to the market factor,
+\begin{align}
+f_t &= c_{s_t}+\sigma_{s_t}\varepsilon_t,
+\qquad \varepsilon_t\sim N(0,1),
+\\
+\Prob(s_t=j\mid s_{t-1}=i)&=p_{ij},
+\qquad i,j\in\{0,1\}.
+\end{align}
+If $\pi_t^{\mathrm{stress}}$ denotes the inferred stressed-state probability, we modify the nominal target and ambiguity scale through
+\begin{align}
+\rho_t^{\mathrm{reg}} &= \rho_t\bigl[1-(1-\eta_\rho)a_t\bigr],
+\\
+\delta_t^{\mathrm{reg}} &= \delta_t\bigl[1+(\eta_\delta-1)a_t\bigr],
+\end{align}
+where $a_t$ is a normalized stress activation score. This design follows Costa and Kwon's logic: regime information enters through the inputs, while the allocation step remains single period and tractable \cite{CostaKwon2020}.
+
+\subsection{Log-return growth appendix}
+
+We also solve a separate log-return growth appendix. If $r_j\in\R^n$ is a log-return sample and $w\in\Delta_n$ is a long-only weight vector, the Kelly objective is
+\begin{equation}
+\max_{w\in\Delta_n}\; \frac{1}{N}\sum_{j=1}^N \log\bigl(\exp(r_j)^\transpose w\bigr).
+\end{equation}
+The appendix compares a tractable log-return proxy with an exact-$p=2$ Wasserstein--Kelly formulation motivated by Li \cite{Li2023}. We keep this branch outside the main ranking because the objective is growth optimality, not volatility-controlled allocation.
+
+\section{Main empirical results}
+
+Table~\ref{tab:mainresults} reports the principal full-sample out-of-sample metrics. The ranking is decisive. The practical \DRMV\ implementation is first on Sharpe. The mixture regime-covariance extension and the paper-reference \DRMV\ calibration are effectively tied just behind it. The Wasserstein-inspired proxy is clearly improved upon once the \DRMV\ family is available.
+
+\begin{table}[H]
+\centering
+\caption{Principal out-of-sample results, 2016-01-07 to 2025-12-30. Returns and volatility are net of transaction costs.}
+\label{tab:mainresults}
+\small
+\setlength{\tabcolsep}{4pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrr}
+\toprule
+Strategy & Return & Volatility & Sharpe & Max DD & Turnover & HHI & Top-3 share \\
+\midrule
+DRMV (practical) & 7.07\% & 8.05\% & 0.878 & -19.75\% & 0.0101 & 0.1116 & 0.4460 \\
+DRMV + regime-cov (mixture) & 7.30\% & 8.37\% & 0.872 & -19.56\% & 0.0139 & 0.1048 & 0.4311 \\
+DRMV (paper-reference) & 7.17\% & 8.22\% & 0.872 & -20.07\% & 0.0100 & 0.1078 & 0.4349 \\
+DRMV + regime-cov (HMM) & 7.78\% & 9.03\% & 0.862 & -20.47\% & 0.0111 & 0.0925 & 0.3628 \\
+Inverse volatility & 7.47\% & 8.73\% & 0.855 & -19.83\% & 0.0119 & 0.1047 & 0.4545 \\
+Sample mean--variance & 13.48\% & 16.03\% & 0.841 & -30.02\% & 0.0083 & 0.2900 & 0.8502 \\
+Wasserstein proxy & 6.88\% & 8.20\% & 0.839 & -22.88\% & 0.0091 & 0.1818 & 0.6321 \\
+Equal weight & 8.99\% & 10.86\% & 0.828 & -22.11\% & 0.0083 & 0.0833 & 0.2500 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+The most revealing comparison is against sample mean--variance. That benchmark posts the highest raw return, but it does so by accepting far more volatility and concentration. Its average Herfindahl index is 0.2900, versus 0.1116 for the leading \DRMV\ specification, and its average top-three weight share is 0.8502, versus 0.4460. In other words, the mean--variance benchmark is not simply more profitable; it is dramatically more concentrated.
+
+The comparison against the Wasserstein-inspired proxy is also instructive. The proxy established that ambiguity-aware penalization can improve on brittle empirical allocation. But the \DRMV\ family advances that result materially. Relative to the proxy, the leading \DRMV\ specification raises Sharpe by 0.0392, improves maximum drawdown by 3.12 percentage points, and cuts the Herfindahl index by 0.0702. That is the core empirical reason the paper should now be centered on \DRMV\ rather than on the proxy branch.
+
+Figure~\ref{fig:sharpe_concentration} makes the trade-off visible. The practical and paper-reference \DRMV\ variants sit in the most attractive part of the Sharpe--concentration plane. Sample mean--variance sits far to the right: it earns a competitive Sharpe, but only by tolerating concentration well beyond the robust alternatives.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{/mnt/data/sharpe_vs_concentration.png}
+\caption{Net Sharpe ratio versus average concentration. The practical and paper-reference \DRMV\ variants occupy the strongest Sharpe--concentration region of the full-sample comparison.}
+\label{fig:sharpe_concentration}
+\end{figure}
+
+\subsection{DRMV diagnostics}
+
+Table~\ref{tab:drmvdiagnostics} reports diagnostics for the main \DRMV\ family. The two \HMM-based variants activate materially larger ambiguity sizes than the practical, paper-reference, and mixture-based specifications. They also diversify more aggressively, which is visible in both the Herfindahl index and the top-three weight share. But that extra fidelity is not free. The \HMM\ variants carry larger forecast--realized risk gaps, and neither one beats the simpler mixture covariance overlay on Sharpe.
+
+\begin{table}[H]
+\centering
+\caption{Selected diagnostics for the main \DRMV\ family.}
+\label{tab:drmvdiagnostics}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Strategy & Average $\delta$ & Turnover & HHI & Risk gap & Skip fraction \\
+\midrule
+DRMV (practical) & 0.000403 & 0.0101 & 0.1116 & 0.0254 & 0.7750 \\
+DRMV (paper-reference) & 0.000463 & 0.0100 & 0.1078 & 0.0261 & 0.5667 \\
+DRMV + regime-cov (mixture) & 0.000432 & 0.0139 & 0.1048 & 0.0296 & 0.7750 \\
+DRMV + regime-cov (HMM) & 0.003100 & 0.0111 & 0.0925 & 0.0416 & 0.7667 \\
+DRMV + regime mean/cov (HMM) & 0.004699 & 0.0109 & 0.0912 & 0.0432 & 0.8000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is the right way to read the regime evidence. The mixture covariance overlay is the strongest empirical regime-conditioned result in the current workflow. The \HMM\ overlays are still valuable, but for a different reason: they push the implementation closer to the regime-switching literature and deliver lower concentration. In the present sample, however, better regime fidelity does not translate into the best overall Sharpe.
+
+\subsection{What the full-sample ranking does and does not imply}
+
+The full-sample ranking should not be mistaken for pathwise dominance. In the early-test segment from 2020-01-09 to 2023-01-03, aggressive sample mean--variance led the field on Sharpe, while the regularized \DRMV\ specification lagged because its lower-beta posture gave up upside during the post-COVID rebound. In the full 2016--2025 comparison, however, the cumulative benefit of lower volatility, lower drawdown, and lower concentration is large enough to place \DRMV\ first overall. That is the appropriate level of the claim.
+
+\section{Discussion}
+
+Three conclusions emerge from the evidence.
+
+First, the center of gravity has shifted from the Wasserstein-inspired proxy to the regularized \DRMV\ family. The proxy remains a useful baseline, but it is no longer the strongest robust allocator in the workflow.
+
+Second, the paper-reference \DRMV\ calibration matters. Its Sharpe ratio, 0.8719, is effectively tied with the mixture regime-covariance overlay and only 0.0062 below the leading practical calibration. That is a strong result because it shows that closer alignment with the robust mean--variance literature does not come at an obvious economic cost.
+
+Third, regime conditioning is best understood as an input refinement rather than the dominant source of performance. The regime overlays improve diversification, and the \HMM\ engine lowers concentration further than the mixture engine. But the main empirical gain still comes from the regularized \DRMV\ structure itself.
+
+More broadly, the operational layer is part of the substantive result. Turnover penalties, no-trade bands, partial execution, validation penalties, and perturbation-sensitive selection all affect the realized ranking. In a research backtest these may look like implementation details. In portfolio construction they are part of the model.
+
+\section{Conclusion}
+
+We implemented a family of robust and non-robust portfolio allocators in one rolling, cost-aware, out-of-sample framework and asked a direct question: which implementation survives distribution shift best? The answer in the present workflow is the practical \DRMV\ specification.
+
+That conclusion rests on more than one metric. The leading \DRMV\ implementation combines the highest full-sample Sharpe ratio with materially lower volatility, drawdown, and concentration than the aggressive sample mean--variance benchmark. It also dominates the older Wasserstein-inspired proxy on the same dimensions. A paper-reference \DRMV\ calibration remains extremely competitive, and regime-conditioned overlays improve diversification further, though not enough to displace the leading specification.
+
+The natural next step is not to oversell theoretical novelty. It is to deepen the empirical program: richer universes, broader corruption mechanisms, and more explicit links between regime diagnostics and ambiguity calibration. But the current evidence is already clear on the central point. In this implementation study, regularized distributionally robust mean--variance allocation is the strongest overall answer.
+
+\appendix
+
+\section{Complete out-of-sample ranking}
+
+Table~\ref{tab:fullrank} reports the complete full-sample ranking across all implemented strategies.
+
+\begin{table}[H]
+\centering
+\caption{Complete full-sample out-of-sample ranking.}
+\label{tab:fullrank}
+\small
+\setlength{\tabcolsep}{4pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+Strategy & Return & Volatility & Sharpe & Max DD & HHI & Top-3 share \\
+\midrule
+DRMV (practical) & 7.07\% & 8.05\% & 0.878 & -19.75\% & 0.1116 & 0.4460 \\
+DRMV + regime-cov (mixture) & 7.30\% & 8.37\% & 0.872 & -19.56\% & 0.1048 & 0.4311 \\
+DRMV (paper-reference) & 7.17\% & 8.22\% & 0.872 & -20.07\% & 0.1078 & 0.4349 \\
+DRMV + regime-cov (HMM) & 7.78\% & 9.03\% & 0.862 & -20.47\% & 0.0925 & 0.3628 \\
+Inverse volatility & 7.47\% & 8.73\% & 0.855 & -19.83\% & 0.1047 & 0.4545 \\
+DRMV + regime mean/cov (HMM) & 7.89\% & 9.30\% & 0.849 & -20.63\% & 0.0912 & 0.3534 \\
+Sample mean--variance & 13.48\% & 16.03\% & 0.841 & -30.02\% & 0.2900 & 0.8502 \\
+Wasserstein proxy & 6.88\% & 8.20\% & 0.839 & -22.88\% & 0.1818 & 0.6321 \\
+Equal weight & 8.99\% & 10.86\% & 0.828 & -22.11\% & 0.0833 & 0.2500 \\
+DRMV regime (legacy mixture) & 6.41\% & 7.82\% & 0.819 & -19.26\% & 0.1257 & 0.5125 \\
+Sample minimum variance & 5.12\% & 6.78\% & 0.755 & -17.24\% & 0.2103 & 0.7500 \\
+Shrinkage minimum variance & 5.11\% & 6.78\% & 0.754 & -17.24\% & 0.2102 & 0.7500 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\section{Bibliography}
+\begin{thebibliography}{99}
+
+\bibitem{Markowitz1952}
+H. Markowitz.
+\newblock Portfolio selection.
+\newblock \emph{The Journal of Finance}, 7(1):77--91, 1952.
+
+\bibitem{EsfahaniKuhn2018}
+P. Mohajerin Esfahani and D. Kuhn.
+\newblock Data-driven distributionally robust optimization using the Wasserstein metric: performance guarantees and tractable reformulations.
+\newblock \emph{Mathematical Programming}, 171:115--166, 2018.
+
+\bibitem{BlanchetChenZhou2022}
+J. Blanchet, L. Chen, and X. Y. Zhou.
+\newblock Distributionally robust mean-variance portfolio selection with Wasserstein distances.
+\newblock \emph{Management Science}, 68(9):6382--6410, 2022.
+
+\bibitem{CostaKwon2020}
+G. Costa and R. H. Kwon.
+\newblock A regime-switching factor model for mean--variance optimization.
+\newblock \emph{Journal of Risk}, 22(4):31--59, 2020.
+
+\bibitem{Li2023}
+J. Y.-M. Li.
+\newblock Wasserstein--Kelly portfolios: a robust data-driven solution to optimize portfolio growth.
+\newblock arXiv:2302.13979, 2023.
+
+\bibitem{Hsieh2023}
+C.-H. Hsieh.
+\newblock On solving robust log-optimal portfolio: A supporting hyperplane approximation approach.
+\newblock \emph{European Journal of Operational Research}, in press, 2023.
+
+\end{thebibliography}
+
+\end{document}

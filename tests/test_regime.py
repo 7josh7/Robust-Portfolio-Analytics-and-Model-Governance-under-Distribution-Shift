@@ -84,3 +84,35 @@ def test_regime_conditioned_inputs_return_mean_and_covariance() -> None:
     assert set(inputs["mean_returns"].index) == set(asset_returns.columns)
     assert inputs["covariance"].shape == (3, 3)
     assert 0.0 <= float(inputs["stressed_probability"]) <= 1.0
+
+
+def test_hmm_regime_conditioned_inputs_return_probabilities_and_covariance() -> None:
+    dates = pd.date_range("2021-01-01", periods=120, freq="W")
+    calm_block = np.random.default_rng(7).normal(0.002, 0.01, size=(60, 3))
+    stressed_block = np.random.default_rng(8).normal(-0.003, 0.025, size=(60, 3))
+    asset_returns = pd.DataFrame(
+        np.vstack([calm_block, stressed_block]),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+    market_factor = asset_returns.mean(axis=1)
+
+    hmm_fit = regime.fit_two_state_hmm(market_factor, lookback=120)
+    filtered = regime.infer_filtered_regime_probs(hmm_fit)
+    smoothed = regime.infer_smoothed_regime_probs(hmm_fit)
+    inputs = regime.estimate_regime_conditioned_inputs_hmm(
+        asset_returns=asset_returns,
+        factor_returns=market_factor,
+        lookback=120,
+        covariance_method="state_aware",
+        calm_covariance_method="ledoit_wolf",
+        stressed_covariance_method="ewma",
+    )
+
+    filtered_state_columns = [column for column in filtered.columns if column.startswith("regime_") and column.endswith("_prob")]
+    smoothed_state_columns = [column for column in smoothed.columns if column.startswith("regime_") and column.endswith("_prob")]
+    assert len(filtered_state_columns) == 2
+    assert len(smoothed_state_columns) == 2
+    assert set(inputs["mean_returns"].index) == set(asset_returns.columns)
+    assert inputs["covariance"].shape == (3, 3)
+    assert inputs["regime_model_version"] in {"hmm_markov_regression", "hmm_fallback_to_mixture"}

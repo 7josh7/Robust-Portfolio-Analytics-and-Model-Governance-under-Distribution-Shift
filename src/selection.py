@@ -5,11 +5,23 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .baselines import ensure_psd
+from .baselines import ensure_psd, inverse_volatility_weight
 from .covariance import estimate_covariance_matrix
-from .regime import estimate_regime_conditioned_inputs, estimate_regime_probabilities
-from .robust import _validation_score, solve_drmv_regularized_min_variance
-from .targets import build_alpha_bar, build_nominal_target, build_regime_conditioned_target_params
+from .features import herfindahl_index, max_drawdown
+from .regime import estimate_regime_conditioned_inputs_hmm, estimate_regime_conditioned_inputs_mixture
+from .robust import (
+    _build_drmv_dpp_program,
+    _matrix_square_root,
+    _validation_score,
+    solve_drmv_regularized_min_variance,
+)
+from .targets import (
+    build_alpha_bar,
+    build_alpha_bar_paper_reference,
+    build_delta_grid_paper_reference,
+    build_nominal_target,
+    build_regime_conditioned_target_params,
+)
 
 
 def _selection_turnover(weights: pd.Series, previous_weights: pd.Series | None) -> float:
@@ -23,31 +35,45 @@ def prepare_regime_conditioned_inputs(
     train_returns: pd.DataFrame,
     lookback: int = 252,
     n_regimes: int = 2,
+    regime_engine: str = "hmm",
     covariance_method: str = "state_aware",
     calm_covariance_method: str = "ledoit_wolf",
     stressed_covariance_method: str = "ewma",
     probability_temperature: float = 2.0,
     stressed_probability_threshold: float = 0.65,
+    switching_variance: bool = True,
+    current_probability_mode: str = "filtered",
+    estimation_probability_mode: str = "smoothed",
     random_state: int = 7,
 ) -> dict[str, Any]:
     market_factor = train_returns.fillna(0.0).mean(axis=1).rename("market_factor")
-    regime_probs = estimate_regime_probabilities(
-        market_factor_series=market_factor,
-        n_regimes=n_regimes,
-        lookback=min(lookback, len(train_returns)),
-        random_state=random_state,
-    )
-    return estimate_regime_conditioned_inputs(
-        asset_returns=train_returns,
-        factor_returns=market_factor,
-        regime_probs=regime_probs,
-        lookback=min(lookback, len(train_returns)),
-        covariance_method=covariance_method,
-        calm_covariance_method=calm_covariance_method,
-        stressed_covariance_method=stressed_covariance_method,
-        probability_temperature=probability_temperature,
-        stressed_probability_threshold=stressed_probability_threshold,
-    )
+    resolved_lookback = min(lookback, len(train_returns))
+    if regime_engine.lower() == "mixture":
+        return estimate_regime_conditioned_inputs_mixture(
+            asset_returns=train_returns,
+            factor_returns=market_factor,
+            lookback=resolved_lookback,
+            covariance_method=covariance_method,
+            calm_covariance_method=calm_covariance_method,
+            stressed_covariance_method=stressed_covariance_method,
+            probability_temperature=probability_temperature,
+            stressed_probability_threshold=stressed_probability_threshold,
+        )
+    if regime_engine.lower() == "hmm":
+        return estimate_regime_conditioned_inputs_hmm(
+            asset_returns=train_returns,
+            factor_returns=market_factor,
+            lookback=resolved_lookback,
+            covariance_method=covariance_method,
+            calm_covariance_method=calm_covariance_method,
+            stressed_covariance_method=stressed_covariance_method,
+            probability_temperature=probability_temperature,
+            stressed_probability_threshold=stressed_probability_threshold,
+            switching_variance=switching_variance,
+            current_probability_mode=current_probability_mode,
+            estimation_probability_mode=estimation_probability_mode,
+        )
+    raise ValueError(f"Unknown regime_engine: {regime_engine}")
 
 
 def build_regime_search_overrides(
@@ -73,6 +99,48 @@ def build_regime_search_overrides(
     }
 
 
+def _resolve_objective_penalty_weights(
+    objective_mode: str,
+    turnover_penalty_weight: float,
+    risk_gap_penalty_weight: float,
+    constraint_penalty_weight: float,
+    fallback_penalty_weight: float,
+    sensitivity_penalty_weight: float,
+    corruption_penalty_weight: float,
+    stress_penalty_weight: float,
+    concentration_penalty_weight: float,
+    drawdown_penalty_weight: float,
+) -> dict[str, float]:
+    weights = {
+        "turnover": float(turnover_penalty_weight),
+        "risk_gap": float(risk_gap_penalty_weight),
+        "constraint": float(constraint_penalty_weight),
+        "fallback": float(fallback_penalty_weight),
+        "sensitivity": float(sensitivity_penalty_weight),
+        "corruption": float(corruption_penalty_weight),
+        "stress": float(stress_penalty_weight),
+        "concentration": float(concentration_penalty_weight),
+        "drawdown": float(drawdown_penalty_weight),
+    }
+    mode = objective_mode.lower()
+    if mode == "production":
+        return weights
+    if mode == "paper_alignment":
+        weights["sensitivity"] = max(weights["sensitivity"], 2.0)
+        weights["corruption"] = max(weights["corruption"], 1.5)
+        weights["stress"] = max(weights["stress"], 4.0)
+        weights["concentration"] = max(weights["concentration"], 0.5)
+        weights["drawdown"] = max(weights["drawdown"], 2.0)
+        return weights
+    if mode == "appendix_kelly":
+        weights["turnover"] = max(weights["turnover"], 0.25)
+        weights["concentration"] = max(weights["concentration"], 1.0)
+        weights["drawdown"] = max(weights["drawdown"], 2.5)
+        weights["sensitivity"] = max(weights["sensitivity"], 1.0)
+        return weights
+    raise ValueError(f"Unknown objective_mode: {objective_mode}")
+
+
 def _generate_corrupted_validation_returns(
     val_returns: pd.DataFrame,
     noise_scale: float,
@@ -92,6 +160,7 @@ def _candidate_sensitivity_penalty(
     candidate_weights: pd.Series,
     mean_returns: pd.Series,
     covariance_matrix: np.ndarray,
+    covariance_factor: np.ndarray,
     train_returns: pd.DataFrame,
     delta: float,
     alpha_bar: float,
@@ -100,32 +169,38 @@ def _candidate_sensitivity_penalty(
     mean_perturbation_scale: float,
     covariance_perturbation_scale: float,
     solver: str,
+    dpp_program: object | None = None,
 ) -> float:
     mean_shock = train_returns.std().fillna(0.0) / max(np.sqrt(len(train_returns)), 1.0)
     perturbed_mean = mean_returns.reindex(train_returns.columns).fillna(0.0) - float(mean_perturbation_scale) * mean_shock
     perturbed_covariance = ensure_psd(
         covariance_matrix + float(covariance_perturbation_scale) * np.diag(np.diag(covariance_matrix))
     )
+    perturbed_covariance_factor = _matrix_square_root(perturbed_covariance)
 
     mean_result = solve_drmv_regularized_min_variance(
         mean_returns=perturbed_mean,
         covariance=covariance_matrix,
+        covariance_factor=covariance_factor,
         delta=delta,
         alpha_bar=alpha_bar,
         p_norm=p_norm,
         lower_bound=bounds[0],
         upper_bound=bounds[1],
         solver=solver,
+        dpp_program=dpp_program,
     )
     covariance_result = solve_drmv_regularized_min_variance(
         mean_returns=mean_returns,
         covariance=perturbed_covariance,
+        covariance_factor=perturbed_covariance_factor,
         delta=delta,
         alpha_bar=alpha_bar,
         p_norm=p_norm,
         lower_bound=bounds[0],
         upper_bound=bounds[1],
         solver=solver,
+        dpp_program=None,
     )
     mean_shift = float((candidate_weights - mean_result["weights"].reindex(candidate_weights.index).fillna(0.0)).abs().sum())
     covariance_shift = float((candidate_weights - covariance_result["weights"].reindex(candidate_weights.index).fillna(0.0)).abs().sum())
@@ -154,6 +229,8 @@ def tune_drmv_regularized_min_variance(
     selection_sensitivity_penalty_weight: float = 0.0,
     selection_corruption_penalty_weight: float = 0.0,
     selection_stress_penalty_weight: float = 0.0,
+    selection_concentration_penalty_weight: float = 0.0,
+    selection_drawdown_penalty_weight: float = 0.0,
     mean_perturbation_scale: float = 0.25,
     covariance_perturbation_scale: float = 0.20,
     corruption_noise_scale: float = 0.15,
@@ -164,6 +241,8 @@ def tune_drmv_regularized_min_variance(
     mean_returns: pd.Series | None = None,
     covariance: np.ndarray | None = None,
     regime_conditioned: bool = False,
+    calibration_mode: str = "practical",
+    objective_mode: str = "production",
     stressed_target_scale: float = 0.85,
     stressed_delta_scale: float = 1.25,
     stressed_probability: float = 0.0,
@@ -173,9 +252,11 @@ def tune_drmv_regularized_min_variance(
     """
     Jointly tune DRMV ambiguity size, robust target adjustment, and covariance engine.
 
-    This is a practical selector rather than the paper's full data-driven
-    inference procedure, but it preserves the paper's key structure: delta and
-    alpha_bar are chosen together and alpha_bar sits below the nominal target.
+    Two calibration modes are available:
+
+    - ``practical`` keeps the current tuned workflow for production-style runs.
+    - ``paper_reference`` uses a more explicit Blanchet-Chen-Zhou-inspired
+      alpha-bar adjustment and sample-size-aware ambiguity grid.
     """
 
     nominal_target, target_source = build_nominal_target(
@@ -186,26 +267,68 @@ def tune_drmv_regularized_min_variance(
         benchmark_returns=benchmark_returns,
         fixed_target_return=fixed_target_return,
     )
+    effective_penalties = _resolve_objective_penalty_weights(
+        objective_mode=objective_mode,
+        turnover_penalty_weight=selection_turnover_penalty_weight,
+        risk_gap_penalty_weight=selection_risk_gap_penalty_weight,
+        constraint_penalty_weight=selection_constraint_penalty_weight,
+        fallback_penalty_weight=selection_fallback_penalty_weight,
+        sensitivity_penalty_weight=selection_sensitivity_penalty_weight,
+        corruption_penalty_weight=selection_corruption_penalty_weight,
+        stress_penalty_weight=selection_stress_penalty_weight,
+        concentration_penalty_weight=selection_concentration_penalty_weight,
+        drawdown_penalty_weight=selection_drawdown_penalty_weight,
+    )
+    working_delta_grid = (
+        build_delta_grid_paper_reference(sample_size=len(train_returns), base_grid=delta_grid)
+        if calibration_mode.lower() == "paper_reference"
+        else sorted(float(delta) for delta in delta_grid)
+    )
+    proxy_weights = (
+        previous_weights.reindex(train_returns.columns).fillna(0.0)
+        if previous_weights is not None
+        else inverse_volatility_weight(train_returns).reindex(train_returns.columns).fillna(0.0)
+    )
+    proxy_norm = float(np.linalg.norm(proxy_weights.to_numpy(dtype=float), ord=p_norm))
 
     best_result: dict[str, Any] | None = None
     best_score = -np.inf
     diagnostics_rows: list[dict[str, Any]] = []
     candidate_records: list[dict[str, Any]] = []
-    corrupted_val_returns = _generate_corrupted_validation_returns(val_returns, noise_scale=corruption_noise_scale)
-    market_proxy = val_returns.fillna(0.0).mean(axis=1)
+    val_returns_filled = val_returns.fillna(0.0)
+    corrupted_val_returns = _generate_corrupted_validation_returns(val_returns, noise_scale=corruption_noise_scale).fillna(0.0)
+    market_proxy = val_returns_filled.mean(axis=1)
     stress_cutoff = market_proxy.quantile(stress_quantile) if not market_proxy.empty else np.nan
     stressed_mask = market_proxy <= stress_cutoff if pd.notna(stress_cutoff) else pd.Series(False, index=market_proxy.index)
 
-    covariance_candidates = [("provided", covariance)] if covariance is not None else [
-        (method, estimate_covariance_matrix(train_returns, method=method))
-        for method in covariance_methods
-    ]
+    if covariance is not None:
+        covariance_psd = ensure_psd(covariance)
+        covariance_candidates = [("provided", covariance_psd, _matrix_square_root(covariance_psd))]
+    else:
+        covariance_candidates = []
+        for method in covariance_methods:
+            covariance_matrix = estimate_covariance_matrix(train_returns, method=method)
+            covariance_candidates.append((method, covariance_matrix, _matrix_square_root(covariance_matrix)))
     mean_vector = mean_returns.reindex(train_returns.columns).fillna(0.0) if mean_returns is not None else train_returns.mean().fillna(0.0)
 
-    for covariance_method, covariance_matrix in covariance_candidates:
-        for delta in delta_grid:
+    for covariance_method, covariance_matrix, covariance_factor in covariance_candidates:
+        dpp_program = _build_drmv_dpp_program(
+            covariance_factor=covariance_factor,
+            lower_bound=bounds[0],
+            upper_bound=bounds[1],
+            p_norm=p_norm,
+        )
+        for delta in working_delta_grid:
             for alpha_scale in alpha_bar_scale_grid:
-                if regime_conditioned:
+                if calibration_mode.lower() == "paper_reference":
+                    alpha_bar, alpha_source = build_alpha_bar_paper_reference(
+                        rho=nominal_target,
+                        delta=delta,
+                        phi_norm_proxy=proxy_norm,
+                        c=alpha_scale,
+                    )
+                    working_delta = float(delta)
+                elif regime_conditioned:
                     target_params = build_regime_conditioned_target_params(
                         rho=nominal_target,
                         delta=delta,
@@ -217,8 +340,9 @@ def tune_drmv_regularized_min_variance(
                     )
                     working_delta = float(target_params["delta"])
                     alpha_bar = float(target_params["alpha_bar"])
+                    alpha_source = str(target_params["alpha_bar_source"])
                 else:
-                    alpha_bar, _ = build_alpha_bar(
+                    alpha_bar, alpha_source = build_alpha_bar(
                         rho=nominal_target,
                         delta=delta,
                         rule=alpha_bar_rule,
@@ -229,6 +353,7 @@ def tune_drmv_regularized_min_variance(
                 result = solve_drmv_regularized_min_variance(
                     mean_returns=mean_vector,
                     covariance=covariance_matrix,
+                    covariance_factor=covariance_factor,
                     delta=working_delta,
                     alpha_bar=alpha_bar,
                     p_norm=p_norm,
@@ -239,17 +364,19 @@ def tune_drmv_regularized_min_variance(
                     turnover_penalty=turnover_penalty,
                     solver=solver,
                     rebalance_date=rebalance_date,
+                    dpp_program=dpp_program,
+                    paper_mode="paper_reference_drmv" if calibration_mode.lower() == "paper_reference" else "practical_tuned_drmv",
                 )
 
-                val_portfolio_returns = val_returns.fillna(0.0) @ result["weights"]
+                val_portfolio_returns = val_returns_filled @ result["weights"]
                 base_metric = _validation_score(val_portfolio_returns, metric="sharpe" if metric == "composite" else metric)
                 validation_turnover = _selection_turnover(result["weights"], previous_weights)
                 realized_validation_vol = float(val_portfolio_returns.std() * np.sqrt(252)) if not val_portfolio_returns.empty else np.nan
                 forecast_vol = float(result.get("forecast_vol", np.nan))
                 risk_gap = abs(realized_validation_vol - forecast_vol) if pd.notna(realized_validation_vol) and pd.notna(forecast_vol) else np.nan
-                corrupted_returns = corrupted_val_returns.fillna(0.0) @ result["weights"]
+                corrupted_returns = corrupted_val_returns @ result["weights"]
                 corrupted_metric = _validation_score(corrupted_returns, metric="sharpe")
-                corruption_penalty = selection_corruption_penalty_weight * float(max(base_metric - corrupted_metric, 0.0))
+                corruption_penalty = effective_penalties["corruption"] * float(max(base_metric - corrupted_metric, 0.0))
                 stressed_returns = val_portfolio_returns.loc[stressed_mask] if stressed_mask.any() else pd.Series(dtype=float)
                 if stressed_returns.empty:
                     stress_penalty = 0.0
@@ -258,17 +385,22 @@ def tune_drmv_regularized_min_variance(
                     stressed_cutoff = stressed_returns.quantile(0.25)
                     stressed_tail = stressed_returns.loc[stressed_returns <= stressed_cutoff]
                     stressed_cvar = float(stressed_tail.mean()) if not stressed_tail.empty else float(stressed_cutoff)
-                    stress_penalty = selection_stress_penalty_weight * abs(min(stressed_cvar, 0.0))
-                binding_penalty = selection_constraint_penalty_weight * float(
+                    stress_penalty = effective_penalties["stress"] * abs(min(stressed_cvar, 0.0))
+                validation_drawdown = abs(min(max_drawdown(val_portfolio_returns), 0.0)) if not val_portfolio_returns.empty else np.nan
+                drawdown_penalty = effective_penalties["drawdown"] * float(np.nan_to_num(validation_drawdown, nan=0.0))
+                concentration_penalty = effective_penalties["concentration"] * herfindahl_index(result["weights"])
+                binding_penalty = effective_penalties["constraint"] * float(
                     np.nan_to_num(max(1e-6 - float(result.get("binding_margin", np.nan)), 0.0), nan=1.0)
                 )
-                fallback_penalty = selection_fallback_penalty_weight * float(result.get("fallback_used", False))
+                fallback_penalty = effective_penalties["fallback"] * float(result.get("fallback_used", False))
                 provisional_score = (
                     base_metric
-                    - selection_turnover_penalty_weight * float(np.nan_to_num(validation_turnover, nan=0.0))
-                    - selection_risk_gap_penalty_weight * float(np.nan_to_num(risk_gap, nan=0.0))
+                    - effective_penalties["turnover"] * float(np.nan_to_num(validation_turnover, nan=0.0))
+                    - effective_penalties["risk_gap"] * float(np.nan_to_num(risk_gap, nan=0.0))
                     - corruption_penalty
                     - stress_penalty
+                    - drawdown_penalty
+                    - concentration_penalty
                     - binding_penalty
                     - fallback_penalty
                 )
@@ -279,14 +411,18 @@ def tune_drmv_regularized_min_variance(
                         "nominal_target_return": float(nominal_target),
                         "target_return": float(alpha_bar),
                         "target_source": target_source,
-                        "target_rule": alpha_bar_rule,
+                        "target_rule": alpha_source,
                         "covariance_method": covariance_method,
                         "regime_conditioned": bool(regime_conditioned),
                         "stressed_probability": float(stressed_probability),
                         "alpha_bar_scale": float(alpha_scale),
+                        "calibration_mode": calibration_mode,
+                        "objective_mode": objective_mode,
                         "validation_sensitivity_penalty": np.nan,
                         "validation_corruption_penalty": float(corruption_penalty),
                         "validation_stress_penalty": float(stress_penalty),
+                        "validation_concentration_penalty": float(concentration_penalty),
+                        "validation_drawdown_penalty": float(drawdown_penalty),
                     }
                 )
                 candidate_records.append(
@@ -294,6 +430,8 @@ def tune_drmv_regularized_min_variance(
                         "result": result,
                         "mean_vector": mean_vector,
                         "covariance_matrix": covariance_matrix,
+                        "covariance_factor": covariance_factor,
+                        "dpp_program": dpp_program,
                         "working_delta": float(working_delta),
                         "alpha_bar": float(alpha_bar),
                         "provisional_score": float(provisional_score),
@@ -311,10 +449,14 @@ def tune_drmv_regularized_min_variance(
                             "validation_sensitivity_penalty": np.nan,
                             "validation_corruption_penalty": float(corruption_penalty),
                             "validation_stress_penalty": float(stress_penalty),
+                            "validation_concentration_penalty": float(concentration_penalty),
+                            "validation_drawdown_penalty": float(drawdown_penalty),
                             "stressed_cvar": float(stressed_cvar) if pd.notna(stressed_cvar) else np.nan,
                             "binding_margin": float(result.get("binding_margin", np.nan)),
                             "binding_penalty": float(binding_penalty),
                             "fallback_penalty": float(fallback_penalty),
+                            "calibration_mode": calibration_mode,
+                            "objective_mode": objective_mode,
                             "status": str(result.get("status", "unknown")),
                             "sensitivity_evaluated": False,
                         },
@@ -325,21 +467,22 @@ def tune_drmv_regularized_min_variance(
         raise ValueError("DRMV tuning failed to produce any candidate solution.")
 
     ranked_candidates = sorted(candidate_records, key=lambda record: record["provisional_score"], reverse=True)
-    if selection_sensitivity_penalty_weight > 0.0:
+    if effective_penalties["sensitivity"] > 0.0:
         top_k = min(max(int(selection_sensitivity_top_k), 1), len(ranked_candidates))
     else:
         top_k = len(ranked_candidates)
 
     for candidate_idx, record in enumerate(ranked_candidates):
         sensitivity_penalty = 0.0
-        sensitivity_evaluated = selection_sensitivity_penalty_weight <= 0.0 or candidate_idx < top_k
-        if sensitivity_evaluated and selection_sensitivity_penalty_weight > 0.0:
+        sensitivity_evaluated = effective_penalties["sensitivity"] <= 0.0 or candidate_idx < top_k
+        if sensitivity_evaluated and effective_penalties["sensitivity"] > 0.0:
             sensitivity_penalty = (
-                selection_sensitivity_penalty_weight
+                effective_penalties["sensitivity"]
                 * _candidate_sensitivity_penalty(
                     candidate_weights=record["result"]["weights"],
                     mean_returns=record["mean_vector"],
                     covariance_matrix=record["covariance_matrix"],
+                    covariance_factor=record["covariance_factor"],
                     train_returns=train_returns,
                     delta=record["working_delta"],
                     alpha_bar=record["alpha_bar"],
@@ -348,6 +491,7 @@ def tune_drmv_regularized_min_variance(
                     mean_perturbation_scale=mean_perturbation_scale,
                     covariance_perturbation_scale=covariance_perturbation_scale,
                     solver=solver,
+                    dpp_program=record["dpp_program"],
                 )
             )
         final_score = float(record["provisional_score"] - sensitivity_penalty) if sensitivity_evaluated else np.nan

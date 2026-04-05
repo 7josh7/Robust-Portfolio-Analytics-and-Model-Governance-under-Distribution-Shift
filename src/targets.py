@@ -69,6 +69,67 @@ def build_alpha_bar(
     return alpha_bar, rule
 
 
+def build_alpha_bar_paper_reference(
+    rho: float,
+    delta: float,
+    phi_norm_proxy: float | None = None,
+    c: float = 1.0,
+    floor: float | None = None,
+) -> tuple[float, str]:
+    """
+    Build a paper-reference robust return threshold.
+
+    This keeps the Blanchet-Chen-Zhou intuition explicit: the robust target
+    sits below the nominal hurdle by an amount linked to ambiguity size. The
+    optional norm proxy allows the adjustment to reflect a benchmark portfolio
+    scale rather than a pure constant.
+    """
+
+    norm_proxy = float(phi_norm_proxy) if phi_norm_proxy is not None else 1.0
+    norm_proxy = max(norm_proxy, 1e-8)
+    alpha_bar = float(rho - float(c) * np.sqrt(max(delta, 0.0)) * norm_proxy)
+    if floor is not None:
+        alpha_bar = max(alpha_bar, float(floor))
+    return alpha_bar, "paper_reference"
+
+
+def build_delta_grid_paper_reference(
+    sample_size: int,
+    base_grid: list[float] | None = None,
+    scale: float = 1.0,
+    multipliers: list[float] | None = None,
+    minimum_delta: float = 1e-6,
+    maximum_delta: float | None = None,
+) -> list[float]:
+    """
+    Build a paper-reference ambiguity grid centered on the n^{-1/2} intuition.
+
+    The paper does not prescribe a single fixed finite-sample grid, so this
+    helper provides a compact research-friendly approximation: it mixes the
+    project's practical grid with additional values whose order reflects the
+    sample-size discussion in the DRMV paper.
+    """
+
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive.")
+
+    if multipliers is None:
+        multipliers = [0.05, 0.10, 0.25, 0.50, 1.0]
+
+    candidates = {0.0}
+    if base_grid is not None:
+        candidates.update(float(delta) for delta in base_grid if float(delta) >= 0.0)
+
+    reference_radius = float(scale) / np.sqrt(float(sample_size))
+    for multiplier in multipliers:
+        candidate = max(float(minimum_delta), (float(multiplier) * reference_radius) ** 2)
+        if maximum_delta is not None:
+            candidate = min(candidate, float(maximum_delta))
+        candidates.add(candidate)
+
+    return sorted(candidates)
+
+
 def build_regime_conditioned_target_params(
     rho: float,
     delta: float,
